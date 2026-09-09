@@ -62,3 +62,13 @@ pub fn force_stop(serial: Option<&str>, package: &str) -> Result<()> {
     run_adb(serial, &["shell", "am", "force-stop", package])?;
     Ok(())
 }
+
+/// 清除指定包名的应用数据（`pm clear`）。
+///
+/// * `package` - 完整包名
+///
+/// 该操作会同时强制停止应用。失败（包不存在、设备断开等）时返回 Err 并透传 adb 的 stderr。
+pub fn clear_data(serial: Option<&str>, package: &str) -> Result<()> {
+    run_adb(serial, &["shell", "pm", "clear", package])?;
+    Ok(())
+}

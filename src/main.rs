@@ -25,6 +25,12 @@ enum Command {
         #[arg(required = true)]
         keywords: Vec<String>,
     },
+    /// 按关键词模糊匹配包名并清除应用数据（pm clear），多关键词为 AND 关系
+    Clear {
+        /// 包名关键词，要求包名同时包含所有关键词
+        #[arg(required = true)]
+        keywords: Vec<String>,
+    },
 }
 
 fn main() {
@@ -39,5 +45,6 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Stop { keywords } => commands::stop::run(cli.serial.as_deref(), &keywords),
+        Command::Clear { keywords } => commands::clear::run(cli.serial.as_deref(), &keywords),
     }
 }
