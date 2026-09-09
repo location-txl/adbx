@@ -63,6 +63,21 @@ pub fn force_stop(serial: Option<&str>, package: &str) -> Result<()> {
     Ok(())
 }
 
+/// 启动指定包名的应用入口 Activity。
+///
+/// 通过 `monkey -p <pkg> -c android.intent.category.LAUNCHER 1` 拉起，
+/// 一次调用即可，无需先解析入口 Activity 名。
+///
+/// * `package` - 完整包名；应用须有 launcher Activity（纯服务类应用没有），
+///   否则 monkey 以非 0 退出，错误透传给调用方
+pub fn launch_app(serial: Option<&str>, package: &str) -> Result<()> {
+    run_adb(
+        serial,
+        &["shell", "monkey", "-p", package, "-c", "android.intent.category.LAUNCHER", "1"],
+    )?;
+    Ok(())
+}
+
 /// 清除指定包名的应用数据（`pm clear`）。
 ///
 /// * `package` - 完整包名
