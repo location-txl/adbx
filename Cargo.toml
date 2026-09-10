@@ -5,7 +5,16 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+# 保留默认 features：裁剪 color/suggestions 对体积无收益（LTO 已消除），却会丢失帮助彩色输出与拼写建议
 clap = { version = "4", features = ["derive"] }
 # TUI 框架；crossterm 经 ratatui::crossterm re-export 使用。
 # 关闭默认 features 以剪掉用不到的 calendar/macros 等 widget，只保留 crossterm 后端
 ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
+
+# release 体积优化：去符号 + fat LTO + 单 codegen unit + panic abort + 体积优先
+[profile.release]
+strip = true
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+opt-level = "z"
