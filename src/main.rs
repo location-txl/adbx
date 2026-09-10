@@ -52,6 +52,15 @@ enum Command {
         #[arg(required = true)]
         keywords: Vec<String>,
     },
+    /// TUI 浏览设备文件系统：键盘导航、Space 标记、Enter 批量拉取到本地目录
+    Browse {
+        /// 设备端起始目录
+        #[arg(default_value = "/sdcard")]
+        path: String,
+        /// 本地输出目录，默认当前工作目录
+        #[arg(short, long)]
+        output: Option<String>,
+    },
     /// 检查 adb 是否已安装并显示版本
     Doctor,
 }
@@ -74,6 +83,9 @@ fn run() -> Result<()> {
             commands::uninstall::run(cli.serial.as_deref(), &keywords, yes)
         }
         Command::Info { keywords } => commands::info::run(cli.serial.as_deref(), &keywords),
+        Command::Browse { path, output } => {
+            commands::browse::run(cli.serial.as_deref(), &path, output.as_deref())
+        }
         // doctor 检查的是 adb 本身而非设备，serial 无意义，忽略
         Command::Doctor => commands::doctor::run(),
     }

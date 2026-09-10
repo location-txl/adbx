@@ -4,7 +4,10 @@
 //! 供各子命令复用，避免散落各处的 Command 拼装。
 
 use anyhow::{Context, Result};
-use std::process::Command;
+use std::io::Read;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::time::Duration;
 
 /// 执行一条 adb 命令，返回 stdout。
 ///
@@ -29,12 +32,18 @@ pub fn run_adb(serial: Option<&str>, args: &[&str]) -> Result<String> {
 ///
 /// 供需要检查 stderr 的调用方使用（如 [`uninstall`]：部分 Android 的
 /// `pm uninstall` 失败时退出码仍为 0，只把报错打在 stderr），其余命令用 [`run_adb`] 即可。
-fn run_adb_raw(serial: Option<&str>, args: &[&str]) -> Result<(String, String)> {
+/// 拼装 adb 命令并完成 `-s <serial>` 设备选择转发，供本文件各调用点复用，
+/// 保证设备选择行为只有一份实现。
+fn adb_command(serial: Option<&str>) -> Command {
     let mut cmd = Command::new("adb");
     if let Some(serial) = serial {
         cmd.args(["-s", serial]);
     }
-    let output = cmd
+    cmd
+}
+
+fn run_adb_raw(serial: Option<&str>, args: &[&str]) -> Result<(String, String)> {
+    let output = adb_command(serial)
         .args(args)
         .output()
         .context("无法启动 adb，请确认已安装并在 PATH 中")?;
@@ -161,14 +170,198 @@ fn is_uninstall_success(stdout: &str, stderr: &str) -> bool {
     stderr.trim().is_empty() && !stdout.contains("Failure")
 }
 
+/// 设备端 shell 参数转义：整体单引号包裹，内部单引号转为 `'\''`（纯函数，可单测）。
+///
+/// adb 会把 `shell` 子命令的参数用空格拼接后交给设备端 shell 解释，
+/// 路径含空格、`$`、`*` 等字符时必须转义；`pull`/`push` 的路径不经 shell，无需转义。
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
+
+/// 列出设备端目录内容（`adb shell ls -l <path>/`）。
+///
+/// * `path` - 设备端路径；内部已做 shell 转义，含空格等特殊字符安全
+///
+/// 强制追加尾部 `/`：路径本身是指向目录的符号链接（如 `/sdcard`）时，
+/// 不加斜杠 ls 会列出链接自身而非目录内容（真机实测）。
+/// 返回 `ls -l` 原始输出（toybox 格式，Android 6+），行解析由调用方
+/// （browse 命令的 `parse_ls`）完成，本函数只管 I/O。
+/// 无权限、路径不存在等失败返回 Err 并透传 stderr。
+pub fn shell_list_dir(serial: Option<&str>, path: &str) -> Result<String> {
+    let path = format!("{}/", path.trim_end_matches('/'));
+    run_adb(serial, &["shell", "ls", "-l", &shell_quote(&path)])
+}
+
+/// 解析 `du -s` 多路径输出（纯函数，可单测）。
+///
+/// toybox 行格式 `KB数\t路径`（路径与入参一致，可含中文/空格）；按路径回填到
+/// 与 `paths` 等长的字节数组（KB × 1024）。设备上已不存在的路径没有对应行，
+/// 保持 0；du 的报错行、格式异常行直接跳过。
+fn parse_du_lines(output: &str, paths: &[String]) -> Vec<u64> {
+    let mut sizes = vec![0u64; paths.len()];
+    for line in output.lines() {
+        let Some((kb, path)) = line.split_once('\t') else { continue };
+        let Ok(kb) = kb.trim().parse::<u64>() else { continue };
+        if let Some(i) = paths.iter().position(|p| p == path) {
+            sizes[i] = kb.saturating_mul(1024);
+        }
+    }
+    sizes
+}
+
+/// 批量查询设备端路径总大小（`adb shell du -s`，一次往返，KB 换算为字节）。
+///
+/// 仅用于进度展示：任一路径不存在/无权限只会让 du 整体退出非 0，stdout 里
+/// 其余路径的大小行仍然有效，因此忽略退出码、只取 stdout 解析（缺行保持 0，
+/// 0 表示大小未知，调用方跳过百分比）；设备断开、adb 缺失时 stdout 为空，
+/// 同样返回全 0，不向上报错。
+pub fn du_totals(serial: Option<&str>, paths: &[String]) -> Vec<u64> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    let quoted: Vec<String> = paths.iter().map(|p| shell_quote(p)).collect();
+    let mut args: Vec<&str> = vec!["shell", "du", "-s"];
+    args.extend(quoted.iter().map(String::as_str));
+    let out = adb_command(serial)
+        .args(&args)
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    parse_du_lines(&out, paths)
+}
+
+/// 拉取设备端文件或目录到本地（`adb pull`，目录递归），并按本地落盘字节回报进度。
+///
+/// * `remote` - 设备端路径（adb 协议直接传输，不经设备端 shell，无需转义）
+/// * `local` - 本地目标目录，原样传给 adb（接受非 UTF-8 路径）；文件落在
+///   `local/<名字>`，目录落在 `local/<目录名>/`，进度即轮询该落点的递归大小
+/// * `total_bytes` - 预期总字节（[`du_totals`] 的产物）；传 0 表示大小未知，不回报进度
+/// * `should_abort` - 中止检查，每轮轮询（约 150ms 一次）前调用；返回 true 即
+///   杀掉 adb pull 子进程并返回 `Ok(false)`。不含事件读取逻辑，由调用方注入，
+///   本模块不依赖终端事件库
+/// * `on_progress` - 进度回调（0-100，仅在值变化时触发；成功收尾定格 100）
+///
+/// 返回 `Ok(true)` 表示完整拉取完成；`Ok(false)` 表示调用方主动取消（取消时
+/// 本地可能残留半截文件，由调用方负责提示）；失败返回 Err 并透传 adb 的 stderr。
+/// adb 1.0.41（platform-tools 35，pty 下实测）已不再输出传输百分比，
+/// 进度改为每 150ms 轮询本地落点的递归大小除以 `total_bytes`，是近似值
+/// （du 按磁盘块统计略偏大、KB 粒度），可能提前到 100 或收尾停在 99，仅作展示。
+/// 本地同名文件会被覆盖、同名目录合并。
+pub fn pull_with_progress(
+    serial: Option<&str>,
+    remote: &str,
+    local: &Path,
+    total_bytes: u64,
+    should_abort: impl Fn() -> bool,
+    mut on_progress: impl FnMut(u8),
+) -> Result<bool> {
+    let mut child = adb_command(serial)
+        .arg("pull")
+        .arg(remote)
+        .arg(local)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("无法启动 adb，请确认已安装并在 PATH 中")?;
+
+    // 两个管道各自交给独立线程持续排空（见 spawn_drain 注释），
+    // 否则输出超过管道缓冲时 adb 阻塞在写端、try_wait 永远等不到退出
+    let out_pipe = child.stdout.take().map(spawn_drain);
+    let err_pipe = child.stderr.take().map(spawn_drain);
+    // 进度观测的本地落点：adb pull 的落盘位置即 local/<remote 的最后一段名字>
+    let watch = local.join(remote.rsplit('/').next().unwrap_or(remote));
+
+    let mut last: Option<u8> = None;
+    loop {
+        // 中止检查放在最前：取消优先于进度回报与退出判定
+        if should_abort() {
+            // 杀掉 adb pull 并回收子进程；本地残留半截文件由调用方提示
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(false);
+        }
+        if let Some(status) = child.try_wait().context("等待 adb pull 结束失败")? {
+            let out = out_pipe.map(join_drain).unwrap_or_default();
+            let err = err_pipe.map(join_drain).unwrap_or_default();
+            if !status.success() {
+                // stderr 为空时兜底 stdout（个别失败形态只打 stdout）
+                let detail = if err.trim().is_empty() { out } else { err };
+                anyhow::bail!("adb pull 失败：{}", detail.trim());
+            }
+            if total_bytes > 0 && last != Some(100) {
+                on_progress(100);
+            }
+            return Ok(true);
+        }
+        // total_bytes 为 0（大小未知）时 checked_div 得 None，跳过进度回报
+        if let Some(pct) = (tree_size(&watch).min(total_bytes) * 100)
+            .checked_div(total_bytes)
+            .map(|v| v as u8)
+            && last != Some(pct)
+        {
+            last = Some(pct);
+            on_progress(pct);
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+}
+
+/// 在独立线程读空一个子进程管道并容错解码为字符串（读失败按空处理）。
+///
+/// 必须与轮询等待并行：adb pull 目录时对每个特殊文件/失效符号链接都会立即
+/// 向 stderr 写一行警告，若等到子进程退出后才读管道，输出累计超过管道缓冲
+/// （macOS 默认 16KB）会让 adb 阻塞在写端永不退出，轮询循环随之死锁。
+fn spawn_drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        String::from_utf8_lossy(&buf).into_owned()
+    })
+}
+
+/// 等 reader 线程结束，取回管道全文（线程意外中止按空处理）。
+fn join_drain(handle: std::thread::JoinHandle<String>) -> String {
+    handle.join().unwrap_or_default()
+}
+
+/// 递归统计本地路径的逻辑大小（纯本地 I/O，不涉设备）：
+/// 文件取字节长度，目录递归求和；不跟随符号链接，读取失败的子项按 0 计。
+fn tree_size(path: &Path) -> u64 {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if !meta.is_dir() {
+        return meta.len();
+    }
+    let Ok(read_dir) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    read_dir.flatten().map(|e| tree_size(&e.path())).sum()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{is_uninstall_success, parse_adb_version};
+    use super::{du_totals, is_uninstall_success, parse_adb_version, parse_du_lines, pull_with_progress, shell_quote, tree_size};
 
     #[test]
     fn parses_standard_version_output() {
         let out = "Android Debug Bridge version 1.0.41\nVersion 35.0.0-11465562\n";
         assert_eq!(parse_adb_version(out).as_deref(), Some("1.0.41"));
+    }
+
+    #[test]
+    fn shell_quote_wraps_plain_and_special_names() {
+        // 普通名字与含空格/通配符的名字：整体单引号包裹即安全
+        assert_eq!(shell_quote("DCIM"), "'DCIM'");
+        assert_eq!(shell_quote("My Files"), "'My Files'");
+        assert_eq!(shell_quote("a$(rm)*c"), "'a$(rm)*c'");
+    }
+
+    #[test]
+    fn shell_quote_escapes_inner_single_quotes() {
+        // 内部单引号：闭合引号 + 转义单引号 + 重新开引号，拼回 it's
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
     }
 
     #[test]
@@ -203,5 +396,107 @@ mod tests {
     #[ignore = "需要连接一台 adb 设备"]
     fn uninstall_failure_on_real_device() {
         assert!(super::uninstall(None, "com.nonexistent.adbx.regression").is_err());
+    }
+
+    #[test]
+    fn parses_du_lines_with_tab_paths() {
+        // 真机 toybox du -s 多路径输出（\r\n 换行、路径可含中文），行序与入参无关
+        let paths: Vec<String> =
+            ["/sdcard/DCIM", "/sdcard/Download/微信.apk", "/gone"].map(String::from).into_iter().collect();
+        let out = "265192\t/sdcard/Download/微信.apk\r\n4\t/sdcard/DCIM\r\n";
+        assert_eq!(parse_du_lines(out, &paths), vec![4 * 1024, 265192 * 1024, 0]);
+    }
+
+    #[test]
+    fn parse_du_lines_skips_error_and_junk_lines() {
+        // du 的报错行没有 \t、纯垃圾行数字不合法：跳过，不影响其余行回填
+        let paths: Vec<String> = ["/a", "/b"].map(String::from).into_iter().collect();
+        let out = "du: /gone: No such file or directory\r\n7\t/a\r\njunk\r\n8\t/b\r\n";
+        assert_eq!(parse_du_lines(out, &paths), vec![7 * 1024, 8 * 1024]);
+    }
+
+    #[test]
+    fn tree_size_sums_nested_files() {
+        let dir = std::env::temp_dir().join(format!("adbx_tree_size_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("a.bin"), vec![0u8; 300]).unwrap();
+        std::fs::write(dir.join("sub/b.bin"), vec![0u8; 700]).unwrap();
+        assert_eq!(tree_size(&dir), 1000);
+        assert_eq!(tree_size(&dir.join("sub/b.bin")), 700);
+        assert_eq!(tree_size(&dir.join("missing")), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 真机回归：du_totals 查大小、pull_with_progress 全程进度单调不减且收尾 100。
+    /// 设备端生成 10MB 临时文件拉回本机，结束自清理。手动运行：
+    /// `cargo test pull_progress_on_real_device -- --ignored`
+    #[test]
+    #[ignore = "需要连接一台 adb 设备"]
+    fn pull_progress_on_real_device() {
+        let remote = "/data/local/tmp/adbx_pct_test.bin";
+        super::run_adb(
+            None,
+            &["shell", "dd", "if=/dev/zero", &format!("of={remote}"), "bs=1048576", "count=10"],
+        )
+        .unwrap();
+
+        let sizes = du_totals(None, &[remote.to_owned()]);
+        // du 按磁盘块统计，允许小幅偏差
+        assert!(sizes[0].abs_diff(10 * 1024 * 1024) < 64 * 1024, "du 结果 {sizes:?}");
+
+        let out_dir = std::env::temp_dir().join(format!("adbx_pct_out_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out_dir);
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        let mut percents = Vec::new();
+        let watch = out_dir.join("adbx_pct_test.bin");
+        let done =
+            pull_with_progress(None, remote, &out_dir, sizes[0], || false, |p| percents.push(p))
+                .unwrap();
+        assert!(done, "未取消时应报告完成");
+        assert_eq!(percents.last(), Some(&100));
+        assert!(percents.windows(2).all(|w| w[0] <= w[1]), "进度非单调：{percents:?}");
+        assert_eq!(std::fs::metadata(&watch).unwrap().len(), 10 * 1024 * 1024);
+
+        super::run_adb(None, &["shell", "rm", remote]).unwrap();
+        let _ = std::fs::remove_dir_all(&out_dir);
+    }
+
+    /// 真机回归：拉取中途触发中止回调，应返回 Ok(false) 且子进程被杀（本地残留半截文件）。
+    /// 设备端生成 100MB 临时文件，首次进度回报后置取消标记，结束自清理。
+    /// 手动运行：`cargo test pull_cancel_on_real_device -- --ignored`
+    #[test]
+    #[ignore = "需要连接一台 adb 设备"]
+    fn pull_cancel_on_real_device() {
+        let remote = "/data/local/tmp/adbx_cancel_test.bin";
+        super::run_adb(
+            None,
+            &["shell", "dd", "if=/dev/zero", &format!("of={remote}"), "bs=1048576", "count=100"],
+        )
+        .unwrap();
+
+        let out_dir = std::env::temp_dir().join(format!("adbx_cancel_out_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&out_dir);
+        std::fs::create_dir_all(&out_dir).unwrap();
+
+        // 首次进度回报后置取消标记：确保 adb pull 已跑起来再杀
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let abort_flag = std::sync::Arc::clone(&flag);
+        let mark_flag = std::sync::Arc::clone(&flag);
+        let done = pull_with_progress(
+            None,
+            remote,
+            &out_dir,
+            100 * 1024 * 1024,
+            // 进度首次回报置位后，下一轮轮询（≤150ms 后）即取消
+            move || abort_flag.load(std::sync::atomic::Ordering::Relaxed),
+            move |_| mark_flag.store(true, std::sync::atomic::Ordering::Relaxed),
+        )
+        .unwrap();
+        assert!(!done, "触发中止回调后应返回 Ok(false)");
+
+        super::run_adb(None, &["shell", "rm", remote]).unwrap();
+        let _ = std::fs::remove_dir_all(&out_dir);
     }
 }
