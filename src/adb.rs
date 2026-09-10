@@ -111,6 +111,16 @@ pub fn launch_app(serial: Option<&str>, package: &str) -> Result<()> {
     Ok(())
 }
 
+/// 获取指定包名的 dumpsys 信息（`dumpsys package <pkg>`）。
+///
+/// * `package` - 完整包名；包不存在时输出可能为空，由调用方解析降级
+///
+/// 返回 dumpsys 原文，版本字段解析由调用方（info 命令）完成。
+/// 设备断开等失败场景返回 Err 并透传 adb 的 stderr。
+pub fn dump_package(serial: Option<&str>, package: &str) -> Result<String> {
+    run_adb(serial, &["shell", "dumpsys", "package", package])
+}
+
 /// 清除指定包名的应用数据（`pm clear`）。
 ///
 /// * `package` - 完整包名

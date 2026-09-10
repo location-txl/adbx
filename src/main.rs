@@ -46,6 +46,12 @@ enum Command {
         #[arg(required = true)]
         keywords: Vec<String>,
     },
+    /// 按关键词模糊匹配包名并展示完整包名及版本信息（dumpsys package），多命中时全部展示
+    Info {
+        /// 包名关键词，要求包名同时包含所有关键词
+        #[arg(required = true)]
+        keywords: Vec<String>,
+    },
     /// 检查 adb 是否已安装并显示版本
     Doctor,
 }
@@ -67,6 +73,7 @@ fn run() -> Result<()> {
         Command::Uninstall { yes, keywords } => {
             commands::uninstall::run(cli.serial.as_deref(), &keywords, yes)
         }
+        Command::Info { keywords } => commands::info::run(cli.serial.as_deref(), &keywords),
         // doctor 检查的是 adb 本身而非设备，serial 无意义，忽略
         Command::Doctor => commands::doctor::run(),
     }
