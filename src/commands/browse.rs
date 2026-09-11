@@ -1,9 +1,11 @@
-//! `adbx browse` 子命令：TUI 浏览设备文件系统，Space 标记、Enter 批量拉取到本地。
+//! `adbx browse` 子命令：TUI 浏览设备文件系统，Space 标记、Enter 批量拉取到本地，
+//! `/` 现场筛选、`S`/`O`（大小写均可）切换排序键与方向。
 //!
 //! 文件内分两层：与设备无关的解析/路径/格式化纯函数在前（可单测），
 //! App 状态机、渲染与事件循环在后；adb 调用统一经 [`crate::adb`]，
 //! 本模块不直接 spawn 进程。
 
+use std::cmp::Ordering;
 use std::collections::HashSet;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -38,11 +40,48 @@ struct Entry {
     kind: EntryKind,
     /// 字节数；目录为其自身 inode 大小（通常 4096），仅作展示
     size: u64,
+    /// 修改时间的原始展示串（常规 `2024-05-01 12:34`；旧格式变体含年份）
+    date: String,
+    /// 修改时间数值键（[`parse_mtime_key`]），日期排序用；解析不了为 0
+    mtime: u64,
 }
 
 impl Entry {
     fn is_dir(&self) -> bool {
         self.kind == EntryKind::Dir
+    }
+}
+
+/// 排序键：`S` 循环切换，`O` 在当前键上翻转方向。
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum SortKey {
+    Name,
+    Size,
+    Date,
+}
+
+impl SortKey {
+    /// 名称 → 大小 → 日期 → 名称。
+    fn cycle(self) -> Self {
+        match self {
+            SortKey::Name => SortKey::Size,
+            SortKey::Size => SortKey::Date,
+            SortKey::Date => SortKey::Name,
+        }
+    }
+
+    /// 标题栏中文标签。
+    fn label(self) -> &'static str {
+        match self {
+            SortKey::Name => "名称",
+            SortKey::Size => "大小",
+            SortKey::Date => "日期",
+        }
+    }
+
+    /// 自然方向：名称升序，大小/日期降序（`S` 切键时重置到该方向）。
+    fn default_desc(self) -> bool {
+        !matches!(self, SortKey::Name)
     }
 }
 
@@ -86,16 +125,22 @@ fn parse_ls_line(line: &str) -> Option<Entry> {
     };
     // size 解析失败即滤掉非目录行（total、ls: 报错行等）。
     // 例外：字符/块设备的 size 位置是 "major, minor"（如 /dev/null 的 5, 1），
-    // 含空格占两列，名字相应后移到第 9 字段（0 起 8），size 按 0 计
+    // 含空格占两列，名字相应后移到第 9 字段（0 起 8），size 按 0 计，
+    // date/time 也相应后移一字段（常规行在第 6/7 字段，0 起 5/6）
     let size_field = line.split_whitespace().nth(4)?;
-    let (size, name_field) = if kind == EntryKind::Other && size_field.contains(',') {
-        (0, 8)
+    let (size, date_field, name_field) = if kind == EntryKind::Other && size_field.contains(',') {
+        (0, 6, 8)
     } else {
         match size_field.parse() {
-            Ok(n) => (n, 7),
+            Ok(n) => (n, 5, 7),
             Err(_) => return None,
         }
     };
+    let mut date_time = line.split_whitespace();
+    let date = date_time.nth(date_field)?;
+    let time = date_time.next()?;
+    let mtime = parse_mtime_key(date, time);
+    let date = format!("{date} {time}");
     let mut name = &line[field_offset(line, name_field)?..];
     if kind == EntryKind::Symlink
         && let Some(pos) = name.rfind(" -> ")
@@ -112,7 +157,34 @@ fn parse_ls_line(line: &str) -> Option<Entry> {
     if matches!(name, "." | "..") || name.bytes().any(|b| b.is_ascii_control()) {
         return None;
     }
-    Some(Entry { name: name.to_owned(), kind, size })
+    Some(Entry { name: name.to_owned(), kind, size, date, mtime })
+}
+
+/// 把 `ls -l` 的日期/时间两字段折算为可比较的数值键（纯函数，可单测）。
+///
+/// 常规 toybox 格式 `2024-05-01` + `12:34` → `202405011234`：各段固定乘法间隔
+/// 落位、不补零也不串位，数值序即时间序；旧文件变体 time 位是 4 位年份
+/// （`2023`）按该年 1 月 1 日近似；带秒的 `12:34:56` 取前两段；任一段解析
+/// 不了返回 0，日期排序中视为最旧（同值再退名称序）。
+fn parse_mtime_key(date: &str, time: &str) -> u64 {
+    // "2024-05-01" → [2024, 5, 1]；任一段非数字返回 None
+    fn numeric_parts(s: &str, sep: char) -> Option<Vec<u64>> {
+        s.split(sep).map(|p| p.parse().ok()).collect()
+    }
+    let key = |y: u64, mo: u64, d: u64, h: u64, mi: u64| {
+        y * 100_000_000 + mo * 1_000_000 + d * 10_000 + h * 100 + mi
+    };
+    let Some(ymd) = numeric_parts(date, '-') else { return 0 };
+    let [y, mo, d] = ymd[..] else { return 0 };
+    // time 位是纯数字：只可能是 4 位年份的旧格式变体，按该年年初近似
+    if let Ok(year) = time.parse::<u64>() {
+        return if (1000..10000).contains(&year) { key(year, 1, 1, 0, 0) } else { 0 };
+    }
+    let Some(hms) = numeric_parts(time, ':') else { return 0 };
+    if hms.len() < 2 {
+        return 0;
+    }
+    key(y, mo, d, hms[0], hms[1])
 }
 
 /// 返回第 `n` 个（0 起）空白分隔字段的起始字节偏移（纯函数）。
@@ -175,9 +247,38 @@ fn normalize_path(path: &str) -> String {
     if trimmed.is_empty() { "/".to_owned() } else { trimmed.to_owned() }
 }
 
-/// 排序：目录在前，名字大小写不敏感字典序（原地）。
-fn sort_entries(entries: &mut [Entry]) {
-    entries.sort_unstable_by_key(|e| (!e.is_dir(), e.name.to_lowercase()));
+/// 排序（原地）：目录始终置顶（不受方向影响），键内按 `key` 升序、`desc` 时
+/// 反转为降序；同值退回名称序，保证顺序确定。
+fn sort_entries(entries: &mut [Entry], key: SortKey, desc: bool) {
+    entries.sort_unstable_by(|a, b| match (a.is_dir(), b.is_dir()) {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        _ => {
+            let by_name = || a.name.to_lowercase().cmp(&b.name.to_lowercase());
+            let ord = match key {
+                SortKey::Name => by_name(),
+                SortKey::Size => a.size.cmp(&b.size),
+                SortKey::Date => a.mtime.cmp(&b.mtime),
+            }
+            .then_with(by_name);
+            if desc { ord.reverse() } else { ord }
+        }
+    });
+}
+
+/// 筛选视图（纯函数，可单测）：名称大小写不敏感包含过滤词的条目下标（保序）；
+/// 过滤词为 None 或去空白后为空 = 全部可见。
+fn visible_indices(entries: &[Entry], filter: Option<&str>) -> Vec<usize> {
+    let Some(word) = filter.map(str::trim).filter(|w| !w.is_empty()) else {
+        return (0..entries.len()).collect();
+    };
+    let word = word.to_lowercase();
+    entries
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.name.to_lowercase().contains(&word))
+        .map(|(i, _)| i)
+        .collect()
 }
 
 /// 字节数转人类可读：`12 B`、`1.2 KB`、`1.4 GB`（≥1024 进位，保留 1 位小数）。
@@ -249,11 +350,11 @@ fn dup_base_names(targets: &[String]) -> Vec<String> {
     dups
 }
 
-/// 生成列表行 `▸ [✓] name/  1.2 MB`（纯函数，可单测）。
+/// 生成列表行 `▸ [✓] name/  1.2 MB[ · 2024-06-01 08:15]`（纯函数，可单测）。
 ///
 /// `▸` 标光标行，`[✓]`/`[ ]` 标标记状态，`/` 与 `@` 为目录与符号链接后缀；
-/// 前两段黄色高亮，大小淡灰色。
-fn format_row(entry: &Entry, selected: bool, marked: bool) -> Line<'static> {
+/// 前两段黄色高亮，大小与日期淡灰色；日期仅在日期排序时展示（`show_date`）。
+fn format_row(entry: &Entry, selected: bool, marked: bool, show_date: bool) -> Line<'static> {
     let accent = Style::new().fg(Color::Yellow);
     let cursor = if selected { "▸ " } else { "  " };
     let check = if marked { "[✓] " } else { "[ ] " };
@@ -262,12 +363,17 @@ fn format_row(entry: &Entry, selected: bool, marked: bool) -> Line<'static> {
         EntryKind::Symlink => "@",
         _ => "",
     };
-    Line::from(vec![
+    let gray = Style::new().fg(Color::DarkGray);
+    let mut spans = vec![
         Span::styled(cursor, accent),
         Span::styled(check, accent),
         Span::raw(format!("{}{suffix}", entry.name)),
-        Span::styled(format!("  {}", human_size(entry.size)), Style::new().fg(Color::DarkGray)),
-    ])
+        Span::styled(format!("  {}", human_size(entry.size)), gray),
+    ];
+    if show_date {
+        spans.push(Span::styled(format!(" · {}", entry.date), gray));
+    }
+    Line::from(spans)
 }
 
 // ---------- App 状态机 ----------
@@ -305,6 +411,13 @@ struct App {
     /// 整个会话累计拉取成功 / 失败的条数，退出时打印摘要用
     pulled_total: usize,
     failed_total: usize,
+    /// 排序键与方向：`S` 循环切键（重置为该键自然方向）、`O` 翻转方向；跨目录保留
+    sort: SortKey,
+    desc: bool,
+    /// 筛选词：`/` 进入筛选模式后边输边滤；切换目录自动清除
+    filter: Option<String>,
+    /// 是否处于筛选输入模式（Enter 保留筛选退出，Esc 清除筛选退出）
+    searching: bool,
 }
 
 impl App {
@@ -322,6 +435,10 @@ impl App {
             pulling: None,
             pulled_total: 0,
             failed_total: 0,
+            sort: SortKey::Name,
+            desc: false,
+            filter: None,
+            searching: false,
         };
         // 首次加载复用 switch_dir（加载/排序/光标初始化只此一份），失败转 Err
         if !app.switch_dir(cwd, 0) {
@@ -344,10 +461,13 @@ impl App {
     fn switch_dir(&mut self, target: &str, cursor: usize) -> bool {
         match load_dir(self.serial.as_deref(), target) {
             Ok(mut entries) => {
-                sort_entries(&mut entries);
+                sort_entries(&mut entries, self.sort, self.desc);
                 self.cwd = target.to_owned();
                 self.entries = entries;
                 self.error = None;
+                // 筛选是"对当前目录列表"的语义，换目录即失效
+                self.filter = None;
+                self.searching = false;
                 // 光标尽量落在期望行；目录变空则取消选中
                 self.state.select((!self.entries.is_empty()).then(|| cursor.min(self.entries.len() - 1)));
                 true
@@ -364,7 +484,7 @@ impl App {
     /// shell_list_dir 的尾部 `/` 正确列出内容；指向文件的 symlink 进入时
     /// ls 自然报错、经 switch_dir 失败路径停留原地。成功才记录历史。
     fn enter_selected(&mut self) {
-        let Some(i) = self.state.selected() else { return };
+        let Some(i) = self.selected_entry_index() else { return };
         let Some(entry) = self.entries.get(i) else { return };
         if !matches!(entry.kind, EntryKind::Dir | EntryKind::Symlink) {
             self.error = Some(format!("「{}」不是目录，→ 仅用于进入文件夹", entry.name));
@@ -392,9 +512,9 @@ impl App {
         }
     }
 
-    /// 光标上下移动 delta 行，clamp 在 [0, len-1]；空列表不动作。
+    /// 光标上下移动 delta 行，clamp 在 [0, 可见条数-1]（筛选视图内）；空列表不动作。
     fn move_cursor(&mut self, delta: i32) {
-        let len = self.entries.len();
+        let len = self.visible().len();
         if len == 0 {
             return;
         }
@@ -404,12 +524,95 @@ impl App {
 
     /// Space：标记/取消标记当前条目（设备端绝对路径进出 marked 集合）。
     fn toggle_mark(&mut self) {
-        let Some(i) = self.state.selected() else { return };
+        let Some(i) = self.selected_entry_index() else { return };
         let Some(entry) = self.entries.get(i) else { return };
         let path = join_path(&self.cwd, &entry.name);
         if !self.marked.remove(&path) {
             self.marked.insert(path);
         }
+    }
+
+    /// 当前筛选视图：可见条目的 entries 下标（保序）。
+    fn visible(&self) -> Vec<usize> {
+        visible_indices(&self.entries, self.filter.as_deref())
+    }
+
+    /// 光标所指可见位对应的 entries 真实下标（筛选/排序都会改变可见位，
+    /// 标记与进入目录必须映射回真实条目）。
+    fn selected_entry_index(&self) -> Option<usize> {
+        let pos = self.state.selected()?;
+        self.visible().get(pos).copied()
+    }
+
+    /// 可见集变化后同步光标：有可见项则 clamp（原先未选中则选中首个），否则取消选中。
+    fn sync_cursor(&mut self) {
+        let len = self.visible().len();
+        self.state.select(match len {
+            0 => None,
+            _ => Some(self.state.selected().map_or(0, |s| s.min(len - 1))),
+        });
+    }
+
+    /// `/`：进入筛选输入模式（已有筛选词则继续编辑）。
+    fn search_begin(&mut self) {
+        self.searching = true;
+    }
+
+    /// 筛选模式输入一个字符：追加筛选词并即时过滤。
+    fn search_input(&mut self, c: char) {
+        self.filter.get_or_insert_with(String::new).push(c);
+        self.sync_cursor();
+    }
+
+    /// 筛选模式退格：删除筛选词末字符（删空 = 显示全部，仍留在筛选模式）。
+    fn search_del_char(&mut self) {
+        if let Some(word) = self.filter.as_mut() {
+            word.pop();
+            self.sync_cursor();
+        }
+    }
+
+    /// Enter：退出筛选模式；空筛选词视同未筛选（清除）。
+    fn search_commit(&mut self) {
+        self.searching = false;
+        if self.filter.as_deref().is_some_and(|w| w.trim().is_empty()) {
+            self.filter = None;
+        }
+    }
+
+    /// Esc：退出筛选模式并清除筛选（恢复完整列表）。
+    fn search_cancel(&mut self) {
+        self.searching = false;
+        if self.filter.take().is_some() {
+            self.sync_cursor();
+        }
+    }
+
+    /// `S`：切换排序键并重置为该键自然方向，重排当前列表。
+    fn cycle_sort(&mut self) {
+        self.sort = self.sort.cycle();
+        self.desc = self.sort.default_desc();
+        self.resort();
+    }
+
+    /// `O`：在当前排序键上翻转方向（升 ↔ 降），重排当前列表。
+    fn toggle_desc(&mut self) {
+        self.desc = !self.desc;
+        self.resort();
+    }
+
+    /// 按当前键与方向重排，并让光标跟随原条目到新位置（排序是原地换位，
+    /// 下标不跨排序存活，故以目录内唯一的文件名定位原条目）。
+    fn resort(&mut self) {
+        let current = self.selected_entry_index().map(|i| self.entries[i].name.clone());
+        sort_entries(&mut self.entries, self.sort, self.desc);
+        let vis = self.visible();
+        self.state.select(match current {
+            Some(name) => {
+                vis.iter().position(|&i| self.entries[i].name == name).or(Some(0))
+            }
+            None => (!vis.is_empty()).then_some(0),
+        });
     }
 }
 
@@ -499,12 +702,31 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, out_dir: &Path) -> 
         if key.kind != KeyEventKind::Press {
             continue;
         }
+        // 筛选输入模式：可打印字符进筛选词（q 不再退出），Space 仍标记光标条目，
+        // Esc 清除筛选返回，仅 Ctrl-C 整体退出；→/← 不响应（先 Enter/Esc 回浏览模式）
+        if app.searching {
+            match key.code {
+                KeyCode::Esc => app.search_cancel(),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
+                KeyCode::Char(' ') => app.toggle_mark(),
+                KeyCode::Char(c) => app.search_input(c),
+                KeyCode::Backspace => app.search_del_char(),
+                KeyCode::Enter => app.search_commit(),
+                KeyCode::Up => app.move_cursor(-1),
+                KeyCode::Down => app.move_cursor(1),
+                _ => {}
+            }
+            continue;
+        }
         match key.code {
             KeyCode::Up => app.move_cursor(-1),
             KeyCode::Down => app.move_cursor(1),
             KeyCode::Right => app.enter_selected(),
             KeyCode::Left | KeyCode::Backspace => app.go_parent(),
             KeyCode::Char(' ') => app.toggle_mark(),
+            KeyCode::Char('/') => app.search_begin(),
+            KeyCode::Char('S' | 's') => app.cycle_sort(),
+            KeyCode::Char('O' | 'o') => app.toggle_desc(),
             KeyCode::Enter => pull_marked(terminal, app, out_dir)?,
             _ if is_quit_key(key.code, key.modifiers) => return Ok(()),
             _ => {}
@@ -612,7 +834,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
     if !status.is_empty() {
         render_status(frame, status, chunks[1], app.error.is_some());
     }
-    render_help(frame, chunks[2]);
+    render_help(frame, chunks[2], app.searching);
 }
 
 /// 汇总状态区内容：错误横幅、逐条状态行（按 [`StatusLine`] 变体定前缀/颜色）、
@@ -647,24 +869,43 @@ fn status_content(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
-/// 渲染列表区：边框标题为当前路径与已标记数；空目录给行内提示。
+/// 渲染列表区：边框标题为当前路径、已标记数、筛选态（筛选词/匹配数）与排序档；
+/// 空目录与无匹配给行内提示。
 fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
-    let block = Block::bordered().title(format!(" {} ── 已标记 {} ", app.cwd, app.marked.len()));
-    if app.entries.is_empty() {
+    let vis = app.visible();
+    let mut title = format!(" {} ── 已标记 {}", app.cwd, app.marked.len());
+    if app.searching || app.filter.is_some() {
+        let caret = if app.searching { "▏" } else { "" };
+        let word = app.filter.as_deref().unwrap_or("");
+        title.push_str(&format!(" · 筛选:{word}{caret} ({}/{})", vis.len(), app.entries.len()));
+    }
+    title.push_str(&format!(
+        " · 排序:{}{}",
+        app.sort.label(),
+        if app.desc { "↓" } else { "↑" }
+    ));
+    let block = Block::bordered().title(title);
+    if vis.is_empty() {
+        let hint = if app.filter.as_deref().is_some_and(|w| !w.trim().is_empty()) {
+            "(无匹配条目)"
+        } else {
+            "(空目录)"
+        };
         frame.render_widget(
-            Paragraph::new("(空目录)").style(Style::new().fg(Color::DarkGray)).block(block),
+            Paragraph::new(hint).style(Style::new().fg(Color::DarkGray)).block(block),
             area,
         );
         return;
     }
-    let items: Vec<ListItem> = app
-        .entries
+    let sel = app.state.selected();
+    let show_date = app.sort == SortKey::Date;
+    let items: Vec<ListItem> = vis
         .iter()
         .enumerate()
-        .map(|(i, entry)| {
-            let selected = app.state.selected() == Some(i);
+        .map(|(pos, &i)| {
+            let entry = &app.entries[i];
             let marked = app.marked.contains(&join_path(&app.cwd, &entry.name));
-            ListItem::new(format_row(entry, selected, marked))
+            ListItem::new(format_row(entry, sel == Some(pos), marked, show_date))
         })
         .collect();
     frame.render_stateful_widget(List::new(items).block(block), area, &mut app.state);
@@ -676,18 +917,45 @@ fn render_status(frame: &mut Frame, lines: Vec<Line<'static>>, area: Rect, is_er
     frame.render_widget(Paragraph::new(lines).block(Block::bordered().title(title)), area);
 }
 
-/// 渲染底部帮助栏。
-fn render_help(frame: &mut Frame, area: Rect) {
-    frame.render_widget(
-        Paragraph::new("↑↓ 移动 · → 进入 · ←/⌫ 返回 · Space 标记 · Enter 拉取 · q/Esc 退出（拉取中=取消）")
-            .style(Style::new().fg(Color::DarkGray)),
-        area,
-    );
+/// 渲染底部帮助栏：浏览模式与筛选输入模式各一版。
+fn render_help(frame: &mut Frame, area: Rect, searching: bool) {
+    let text = if searching {
+        "输入筛选词（大小写不敏感） · ↑↓ 移动 · Enter 保留筛选 · Esc 清除 · Ctrl-C 退出"
+    } else {
+        "↑↓ 移动 · → 进入 · ←/⌫ 返回 · / 筛选 · S/s 排序 · O/o 方向 · Space 标记 · Enter 拉取 · q/Esc 退出（拉取中=取消）"
+    };
+    frame.render_widget(Paragraph::new(text).style(Style::new().fg(Color::DarkGray)), area);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 造测试条目：date 置空串（不参与断言），mtime 由调用方给。
+    fn mk(name: &str, kind: EntryKind, size: u64, mtime: u64) -> Entry {
+        Entry { name: name.to_owned(), kind, size, date: String::new(), mtime }
+    }
+
+    /// 直接构造 App（同模块可见私有字段），不经 adb 加载目录，纯状态可测。
+    fn app_with_entries(entries: Vec<Entry>) -> App {
+        App {
+            serial: None,
+            cwd: "/sdcard".into(),
+            entries,
+            state: ListState::default(),
+            marked: HashSet::new(),
+            history: Vec::new(),
+            error: None,
+            status: Vec::new(),
+            pulling: None,
+            pulled_total: 0,
+            failed_total: 0,
+            sort: SortKey::Name,
+            desc: false,
+            filter: None,
+            searching: false,
+        }
+    }
 
     /// Android 真机 /sdcard 的典型 toybox ls -l 输出（\r\n 换行，含中文、空格、符号链接）。
     const TYPICAL_LS: &str = "\
@@ -713,6 +981,9 @@ lrwxrwxrwx 1 root root 21 2024-05-01 12:40 loc_kernel -> /sdcard/DCIM\r
         assert_eq!(entries[3].name, "我的 备份.txt");
         assert_eq!(entries[3].kind, EntryKind::File);
         assert_eq!(entries[3].size, 1234567);
+        // 日期字段：原始串保留供展示，数值键供日期排序
+        assert_eq!(entries[0].date, "2024-05-01 12:34");
+        assert_eq!(entries[0].mtime, 2024_0501_1234);
     }
 
     #[test]
@@ -790,16 +1061,190 @@ lrwxrwxrwx 1 root root 21 2024-05-01 12:40 loc_kernel -> /sdcard/DCIM\r
     }
 
     #[test]
+    fn parses_date_and_mtime_from_ls_lines() {
+        let e = parse_ls_line("-rw-rw---- 1 root root 3 2024-06-01 08:15 a.txt").unwrap();
+        assert_eq!(e.date, "2024-06-01 08:15");
+        assert_eq!(e.mtime, 2024_0601_0815);
+        // 年份变体：time 位是 4 位年份，按该年 1 月 1 日近似
+        let e = parse_ls_line("drwxrwx--x 2 root sdcard_rw 4096 2024-05-01 2023 old_dir").unwrap();
+        assert_eq!(e.mtime, 2023_0101_0000);
+        // 带秒变体取前两段
+        let e = parse_ls_line("-rw-rw---- 1 root root 3 2024-06-01 08:15:30 a.txt").unwrap();
+        assert_eq!(e.mtime, 2024_0601_0815);
+        // 设备行（size 为 "major, minor"）日期/时间后移一字段
+        let e = parse_ls_line("crw-rw-rw- 1 root root 5, 1 1970-01-01 08:00 null").unwrap();
+        assert_eq!(e.mtime, 1970_0101_0800);
+        // 非常规日期格式 → 0（日期排序中视为最旧）
+        let e = parse_ls_line("-rw-rw---- 1 root root 3 unknown-date 12:00 weird.txt").unwrap();
+        assert_eq!(e.mtime, 0);
+    }
+
+    #[test]
+    fn parse_mtime_key_handles_variants() {
+        assert_eq!(parse_mtime_key("2024-06-01", "08:15"), 2024_0601_0815);
+        // 段不补零也正确落位（乘法间隔保证不串位）
+        assert_eq!(parse_mtime_key("2024-6-1", "8:05"), 2024_0601_0805);
+        assert_eq!(parse_mtime_key("2024-05-01", "2023"), 2023_0101_0000);
+        assert_eq!(parse_mtime_key("2024-06-01", "08:15:30"), 2024_0601_0815);
+        assert_eq!(parse_mtime_key("bad", "08:15"), 0);
+        assert_eq!(parse_mtime_key("2024-06-01", "nope"), 0);
+        // 纯数字但不是 4 位年份的 time 位无法解释 → 0
+        assert_eq!(parse_mtime_key("2024-06-01", "12"), 0);
+    }
+
+    #[test]
+    fn sort_key_cycles_labels_and_default_direction() {
+        assert_eq!(SortKey::Name.cycle(), SortKey::Size);
+        assert_eq!(SortKey::Size.cycle(), SortKey::Date);
+        assert_eq!(SortKey::Date.cycle(), SortKey::Name);
+        assert!(!SortKey::Name.default_desc());
+        assert!(SortKey::Size.default_desc());
+        assert!(SortKey::Date.default_desc());
+        assert_eq!(SortKey::Size.label(), "大小");
+        assert_eq!(SortKey::Date.label(), "日期");
+    }
+
+    #[test]
     fn sorts_dirs_first_case_insensitive() {
         let mut entries = vec![
-            Entry { name: "b.txt".into(), kind: EntryKind::File, size: 0 },
-            Entry { name: "DCIM".into(), kind: EntryKind::Dir, size: 0 },
-            Entry { name: "abc".into(), kind: EntryKind::Dir, size: 0 },
-            Entry { name: "A.txt".into(), kind: EntryKind::File, size: 0 },
+            mk("b.txt", EntryKind::File, 0, 0),
+            mk("DCIM", EntryKind::Dir, 0, 0),
+            mk("abc", EntryKind::Dir, 0, 0),
+            mk("A.txt", EntryKind::File, 0, 0),
         ];
-        sort_entries(&mut entries);
+        sort_entries(&mut entries, SortKey::Name, false);
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["abc", "DCIM", "A.txt", "b.txt"]);
+        // 方向反转：名称降序，目录组/文件组各自内部反序，目录置顶不变
+        sort_entries(&mut entries, SortKey::Name, true);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["DCIM", "abc", "b.txt", "A.txt"]);
+    }
+
+    #[test]
+    fn sorts_by_size_with_direction_dirs_first() {
+        let mut entries = vec![
+            mk("big", EntryKind::File, 300, 0),
+            mk("small", EntryKind::File, 1, 0),
+            mk("zdir", EntryKind::Dir, 99, 0),
+        ];
+        fn names(es: &[Entry]) -> Vec<&str> { es.iter().map(|e| e.name.as_str()).collect() }
+        sort_entries(&mut entries, SortKey::Size, false);
+        assert_eq!(names(&entries), ["zdir", "small", "big"]);
+        sort_entries(&mut entries, SortKey::Size, true);
+        assert_eq!(names(&entries), ["zdir", "big", "small"]);
+    }
+
+    #[test]
+    fn sorts_by_date_newest_first_unknown_oldest() {
+        let mut entries = vec![
+            mk("old.txt", EntryKind::File, 1, 2023_0101_0000),
+            mk("new.txt", EntryKind::File, 1, 2024_0101_0000),
+            mk("unknown.txt", EntryKind::File, 1, 0),
+            mk("mid.txt", EntryKind::File, 1, 2023_0601_0000),
+        ];
+        fn names(es: &[Entry]) -> Vec<&str> { es.iter().map(|e| e.name.as_str()).collect() }
+        // 降序（自然方向）：新在前；mtime 0 视为最旧落末尾
+        sort_entries(&mut entries, SortKey::Date, true);
+        assert_eq!(names(&entries), ["new.txt", "mid.txt", "old.txt", "unknown.txt"]);
+        // 升序：旧在前
+        sort_entries(&mut entries, SortKey::Date, false);
+        assert_eq!(names(&entries), ["unknown.txt", "old.txt", "mid.txt", "new.txt"]);
+    }
+
+    #[test]
+    fn visible_indices_filters_case_insensitively() {
+        let entries = vec![
+            mk("DCIM", EntryKind::Dir, 0, 0),
+            mk("Music", EntryKind::Dir, 0, 0),
+            mk("notes.txt", EntryKind::File, 0, 0),
+        ];
+        // None/空白 = 不过滤
+        assert_eq!(visible_indices(&entries, None), vec![0, 1, 2]);
+        assert_eq!(visible_indices(&entries, Some("")), vec![0, 1, 2]);
+        assert_eq!(visible_indices(&entries, Some("  ")), vec![0, 1, 2]);
+        // 大小写不敏感子串
+        assert_eq!(visible_indices(&entries, Some("dci")), vec![0]);
+        assert_eq!(visible_indices(&entries, Some("TXT")), vec![2]);
+        assert!(visible_indices(&entries, Some("没有")).is_empty());
+    }
+
+    #[test]
+    fn search_flow_filters_maps_and_cancels() {
+        let mut app = app_with_entries(vec![
+            mk("DCIM", EntryKind::Dir, 0, 0),
+            mk("Music", EntryKind::Dir, 0, 0),
+            mk("notes.txt", EntryKind::File, 0, 0),
+        ]);
+        app.search_begin();
+        assert!(app.searching);
+        app.search_input('t');
+        app.search_input('x');
+        // 只剩 notes.txt：可见位 0 映射回真实下标 2
+        assert_eq!(app.visible(), vec![2]);
+        app.state.select(Some(0));
+        assert_eq!(app.selected_entry_index(), Some(2));
+        // 筛选态下标记（事件循环把 Space 路由到 toggle_mark）作用于真实条目路径
+        app.toggle_mark();
+        assert!(app.marked.contains("/sdcard/notes.txt"));
+        app.toggle_mark();
+        assert!(app.marked.is_empty());
+        // 无匹配 → 取消选中；回退一个字符恢复匹配后光标回落首行
+        app.search_input('q');
+        assert!(app.visible().is_empty());
+        assert_eq!(app.state.selected(), None);
+        app.search_del_char();
+        assert_eq!(app.state.selected(), Some(0));
+        // 退格到空筛选词 = 显示全部，仍处于筛选模式
+        app.search_del_char();
+        app.search_del_char();
+        assert_eq!(app.filter.as_deref(), Some(""));
+        assert_eq!(app.visible().len(), 3);
+        assert!(app.searching);
+        // Enter：保留筛选退出；空词视同未筛选被清除
+        app.search_commit();
+        assert!(!app.searching);
+        assert_eq!(app.filter, None);
+        app.search_begin();
+        app.search_commit();
+        assert_eq!(app.filter, None);
+        // Esc：清除筛选退出筛选模式
+        app.search_begin();
+        app.search_input('m');
+        app.search_cancel();
+        assert!(!app.searching);
+        assert_eq!(app.filter, None);
+        assert_eq!(app.visible().len(), 3);
+    }
+
+    #[test]
+    fn sort_cycles_resort_and_cursor_follows() {
+        let mut app = app_with_entries(vec![
+            mk("b", EntryKind::File, 300, 5),
+            mk("a", EntryKind::File, 1, 9),
+            mk("Z", EntryKind::Dir, 99, 1),
+        ]);
+        // 名称升序的目录置顶基线（与 switch_dir 加载后的顺序一致）
+        sort_entries(&mut app.entries, SortKey::Name, false);
+        app.state.select(Some(1)); // 光标在 "a"
+        assert_eq!(app.entries[1].name, "a");
+        // S：切到大小并重置为自然方向（降序），目录仍置顶；光标跟随 "a" 到新位置
+        app.cycle_sort();
+        assert_eq!(app.sort, SortKey::Size);
+        assert!(app.desc);
+        let names: Vec<&str> = app.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["Z", "b", "a"]);
+        assert_eq!(app.state.selected(), Some(2));
+        // O：翻转为升序，光标仍跟随 "a"
+        app.toggle_desc();
+        let names: Vec<&str> = app.entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["Z", "a", "b"]);
+        assert_eq!(app.state.selected(), Some(1));
+        // 循环回名称键时方向重置为升序
+        app.cycle_sort(); // Date（降序）
+        app.cycle_sort(); // Name（升序）
+        assert_eq!(app.sort, SortKey::Name);
+        assert!(!app.desc);
     }
 
     #[test]
@@ -868,38 +1313,31 @@ lrwxrwxrwx 1 root root 21 2024-05-01 12:40 loc_kernel -> /sdcard/DCIM\r
         let text = |line: &Line<'_>| -> String {
             line.spans.iter().map(|s| s.content.to_string()).collect()
         };
-        let dir = Entry { name: "DCIM".into(), kind: EntryKind::Dir, size: 4096 };
-        let row = text(&format_row(&dir, true, true));
+        let dir = mk("DCIM", EntryKind::Dir, 4096, 0);
+        let row = text(&format_row(&dir, true, true, false));
         assert!(row.contains("▸"));
         assert!(row.contains("[✓]"));
         assert!(row.contains("DCIM/"));
 
-        let file = Entry { name: "notes.txt".into(), kind: EntryKind::File, size: 12 };
-        let row = text(&format_row(&file, false, false));
+        let file = mk("notes.txt", EntryKind::File, 12, 0);
+        let row = text(&format_row(&file, false, false, false));
         assert!(row.contains("[ ]"));
         assert!(!row.contains("notes.txt/"));
         assert!(row.contains("12 B"));
+        // 日期列仅在日期排序时展示
+        let file = Entry { date: "2024-06-01 08:15".into(), ..file };
+        assert!(!text(&format_row(&file, false, false, false)).contains("2024-"));
+        assert!(text(&format_row(&file, false, false, true)).contains(" · 2024-06-01 08:15"));
     }
 
     #[test]
     fn status_renders_warning_lines_in_yellow() {
         // 直接构造 App（同模块可见私有字段），避免为渲染测试发起 adb 调用
-        let app = App {
-            serial: None,
-            cwd: "/sdcard".into(),
-            entries: vec![],
-            state: ListState::default(),
-            marked: HashSet::new(),
-            history: Vec::new(),
-            error: None,
-            status: vec![
-                StatusLine::Ok("ok".into()),
-                StatusLine::Warn("⚠ 本地已存在 DCIM，将被覆盖/合并".into()),
-            ],
-            pulling: None,
-            pulled_total: 0,
-            failed_total: 0,
-        };
+        let mut app = app_with_entries(vec![]);
+        app.status = vec![
+            StatusLine::Ok("ok".into()),
+            StatusLine::Warn("⚠ 本地已存在 DCIM，将被覆盖/合并".into()),
+        ];
         let lines = status_content(&app);
         assert_eq!(lines.len(), 2);
         // 成败行：✓/✗ 前缀 + 正文，两个 Span
