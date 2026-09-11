@@ -40,7 +40,29 @@ pub(super) fn base_name(path: &str) -> &str {
 /// 保证结果恒非空、以 `/` 开头（App.cwd 的不变量）。
 pub(super) fn normalize_path(path: &str) -> String {
     let trimmed = path.trim_end_matches('/');
-    if trimmed.is_empty() { "/".to_owned() } else { trimmed.to_owned() }
+    if trimmed.is_empty() {
+        "/".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
+/// 校验新建文件夹名（纯函数，可单测）：拒绝空/仅空白、`.`、`..`、含 `/`、
+/// 含控制字符的名字；Err 带可直接展示的中文原因。不自动 trim（所见即所建）。
+pub(super) fn validate_dir_name(name: &str) -> Result<(), String> {
+    if name.trim().is_empty() {
+        return Err("文件夹名不能为空".to_owned());
+    }
+    if matches!(name, "." | "..") {
+        return Err("文件夹名不能是 . 或 ..".to_owned());
+    }
+    if name.contains('/') {
+        return Err("文件夹名不能包含 /（只在当前目录下新建一层）".to_owned());
+    }
+    if name.bytes().any(|b| b.is_ascii_control()) {
+        return Err("文件夹名不能包含控制字符".to_owned());
+    }
+    Ok(())
 }
 
 /// 剔除已被其他标记路径覆盖的子路径（如已标记 `/a` 就不再单独拉 `/a/b.txt`），
@@ -121,20 +143,46 @@ mod tests {
     }
 
     #[test]
+    fn validate_dir_name_accepts_and_rejects() {
+        // 合法：普通名、含空格/中文、含单引号（shell_quote 会转义）
+        assert!(validate_dir_name("DCIM").is_ok());
+        assert!(validate_dir_name("新建 目录").is_ok());
+        assert!(validate_dir_name("it's").is_ok());
+        // 非法：空、仅空白、.、..、含 /、含控制字符
+        assert!(validate_dir_name("").is_err());
+        assert!(validate_dir_name("   ").is_err());
+        assert!(validate_dir_name(".").is_err());
+        assert!(validate_dir_name("..").is_err());
+        assert!(validate_dir_name("a/b").is_err());
+        assert!(validate_dir_name("a\u{1b}b").is_err());
+    }
+
+    #[test]
     fn filter_covered_drops_children_of_marked_parents() {
         // 已标记 /a 时，其子路径 /a/b.txt 不再单独拉取
-        let marked: HashSet<String> = ["/a", "/a/b.txt", "/c"].map(String::from).into_iter().collect();
-        assert_eq!(filter_covered(&marked), vec!["/a".to_owned(), "/c".to_owned()]);
+        let marked: HashSet<String> = ["/a", "/a/b.txt", "/c"]
+            .map(String::from)
+            .into_iter()
+            .collect();
+        assert_eq!(
+            filter_covered(&marked),
+            vec!["/a".to_owned(), "/c".to_owned()]
+        );
         // 无嵌套关系时全部保留，且顺序确定
         let flat: HashSet<String> = ["/y", "/x"].map(String::from).into_iter().collect();
-        assert_eq!(filter_covered(&flat), vec!["/x".to_owned(), "/y".to_owned()]);
+        assert_eq!(
+            filter_covered(&flat),
+            vec!["/x".to_owned(), "/y".to_owned()]
+        );
     }
 
     #[test]
     fn dup_base_names_finds_cross_dir_collisions() {
         // 不同父目录下的同名条目会落到同一本地路径 out/<名字>
-        let targets: Vec<String> =
-            ["/a/DCIM", "/b/DCIM", "/b/DCIM2", "/c/Music"].map(String::from).into_iter().collect();
+        let targets: Vec<String> = ["/a/DCIM", "/b/DCIM", "/b/DCIM2", "/c/Music"]
+            .map(String::from)
+            .into_iter()
+            .collect();
         assert_eq!(dup_base_names(&targets), vec!["DCIM".to_owned()]);
         // 无重复时为空
         let flat: Vec<String> = ["/x/a", "/y/b"].map(String::from).into_iter().collect();

@@ -83,10 +83,7 @@ pub fn match_failure(keywords: &[String], matched: PackageMatch) -> anyhow::Erro
                 .collect::<Vec<_>>()
                 .join("\n")
         ),
-        PackageMatch::None => anyhow::anyhow!(
-            "没有包同时包含 {}",
-            keywords_summary(keywords)
-        ),
+        PackageMatch::None => anyhow::anyhow!("没有包同时包含 {}", keywords_summary(keywords)),
         // 唯一/精确命中不是失败场景，调用方不该把这种结果传进来
         PackageMatch::Exact(_) | PackageMatch::Unique(_) => {
             unreachable!("命中唯一/精确包时不应走失败分支")
@@ -109,10 +106,7 @@ mod tests {
     #[test]
     fn exact_match_should_take_priority_over_substring_hits() {
         // "com.v1.chat" 同时也是 "com.v1.chat" 的子串场景，精确命中必须赢
-        let pkgs = vec![
-            "com.v1.chat".to_string(),
-            "com.v1.chat.plugin".to_string(),
-        ];
+        let pkgs = vec!["com.v1.chat".to_string(), "com.v1.chat.plugin".to_string()];
         assert!(matches!(
             match_packages(&pkgs, &["com.v1.chat".to_string()]),
             PackageMatch::Exact(p) if p == "com.v1.chat"

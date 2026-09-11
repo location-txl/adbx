@@ -1,7 +1,7 @@
 //! 事件循环、批量拉取与渲染：`browse` 的 TUI 层。
 //!
-//! adb 调用只发生在批量拉取路径（`du -s` 统计与逐项 pull，经 [`crate::adb`]），
-//! 状态变更全部走 [`super::app`] 的方法。
+//! adb 调用只发生在批量拉取路径（`du -s` 统计与逐项 pull）与新建文件夹
+//! （`shell mkdir`，经 [`crate::adb`]），状态变更全部走 [`super::app`] 的方法。
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -17,7 +17,7 @@ use ratatui::{DefaultTerminal, Frame};
 
 use super::app::{App, StatusLine};
 use super::model::{Entry, EntryKind, SortKey};
-use super::paths::{base_name, dup_base_names, filter_covered, join_path};
+use super::paths::{base_name, dup_base_names, filter_covered, join_path, validate_dir_name};
 use crate::adb;
 
 /// 是否退出/取消键（q/Esc/Ctrl-C），与底部帮助栏文案保持一致。
@@ -31,7 +31,9 @@ fn is_quit_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
 fn cancel_requested() -> bool {
     while let Ok(true) = event::poll(Duration::ZERO) {
         match event::read() {
-            Ok(Event::Key(k)) if k.kind == KeyEventKind::Press && is_quit_key(k.code, k.modifiers) => {
+            Ok(Event::Key(k))
+                if k.kind == KeyEventKind::Press && is_quit_key(k.code, k.modifiers) =>
+            {
                 return true;
             }
             Ok(_) => {}
@@ -44,10 +46,16 @@ fn cancel_requested() -> bool {
 
 /// TUI 主循环：绘制一帧 → 阻塞等按键 → 分发。
 /// 只有终端 I/O 本身失败（终端不可用）才向上返回 Err。
-pub(super) fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, out_dir: &Path) -> Result<()> {
+pub(super) fn event_loop(
+    terminal: &mut DefaultTerminal,
+    app: &mut App,
+    out_dir: &Path,
+) -> Result<()> {
     loop {
         terminal.draw(|frame| ui(frame, app))?;
-        let Event::Key(key) = event::read()? else { continue };
+        let Event::Key(key) = event::read()? else {
+            continue;
+        };
         // 只响应按下事件：kitty 键盘协议下 Release/Repeat 也会上报
         if key.kind != KeyEventKind::Press {
             continue;
@@ -57,13 +65,30 @@ pub(super) fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, out_dir:
         if app.searching {
             match key.code {
                 KeyCode::Esc => app.search_cancel(),
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(()),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Ok(());
+                }
                 KeyCode::Char(' ') => app.toggle_mark(),
                 KeyCode::Char(c) => app.search_input(c),
                 KeyCode::Backspace => app.search_del_char(),
                 KeyCode::Enter => app.search_commit(),
                 KeyCode::Up => app.move_cursor(-1),
                 KeyCode::Down => app.move_cursor(1),
+                _ => {}
+            }
+            continue;
+        }
+        // 新建文件夹输入模式：可打印字符（含空格）进名字，Enter 创建，Esc 取消；
+        // q 等可打印字符均为名字字符，仅 Ctrl-C 整体退出
+        if app.creating {
+            match key.code {
+                KeyCode::Esc => app.create_cancel(),
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    return Ok(());
+                }
+                KeyCode::Char(c) => app.create_input(c),
+                KeyCode::Backspace => app.create_del_char(),
+                KeyCode::Enter => mkdir_confirm(app),
                 _ => {}
             }
             continue;
@@ -75,6 +100,7 @@ pub(super) fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, out_dir:
             KeyCode::Left | KeyCode::Backspace => app.go_parent(),
             KeyCode::Char(' ') => app.toggle_mark(),
             KeyCode::Char('/') => app.search_begin(),
+            KeyCode::Char('M' | 'm') => app.create_begin(),
             KeyCode::Char('S' | 's') => app.cycle_sort(),
             KeyCode::Char('O' | 'o') => app.toggle_desc(),
             KeyCode::Enter => pull_marked(terminal, app, out_dir)?,
@@ -96,7 +122,9 @@ pub(super) fn event_loop(terminal: &mut DefaultTerminal, app: &mut App, out_dir:
 /// 并丢弃拉取期间积压的按键，防止恢复后光标乱跳。
 fn pull_marked(terminal: &mut DefaultTerminal, app: &mut App, out_dir: &Path) -> Result<()> {
     if app.marked.is_empty() {
-        app.status = vec![StatusLine::Err("未标记任何条目，先按 Space 标记".to_owned())];
+        app.status = vec![StatusLine::Err(
+            "未标记任何条目，先按 Space 标记".to_owned(),
+        )];
         return Ok(());
     }
     let targets = filter_covered(&app.marked);
@@ -104,12 +132,16 @@ fn pull_marked(terminal: &mut DefaultTerminal, app: &mut App, out_dir: &Path) ->
     app.error = None;
     // 落点冲突提示（只提示不阻断），同样计入 8 条上限，防止挤占列表区
     for name in dup_base_names(&targets) {
-        app.push_status(StatusLine::Warn(format!("⚠ 多个同名条目 {name}，将合并/覆盖到同一路径")));
+        app.push_status(StatusLine::Warn(format!(
+            "⚠ 多个同名条目 {name}，将合并/覆盖到同一路径"
+        )));
     }
     let mut warned_local = HashSet::new();
     for name in targets.iter().map(|p| base_name(p)) {
         if out_dir.join(name).exists() && warned_local.insert(name.to_owned()) {
-            app.push_status(StatusLine::Warn(format!("⚠ 本地已存在 {name}，将被覆盖/合并")));
+            app.push_status(StatusLine::Warn(format!(
+                "⚠ 本地已存在 {name}，将被覆盖/合并"
+            )));
         }
     }
     let total = targets.len();
@@ -139,7 +171,10 @@ fn pull_marked(terminal: &mut DefaultTerminal, app: &mut App, out_dir: &Path) ->
         );
         match result {
             Ok(true) => {
-                app.push_status(StatusLine::Ok(format!("{remote} → {}", local_path.display())));
+                app.push_status(StatusLine::Ok(format!(
+                    "{remote} → {}",
+                    local_path.display()
+                )));
                 app.pulled_total += 1;
                 // 已完成项即时移出标记；取消中止时未完成项因此得以保留
                 app.marked.remove(remote);
@@ -169,10 +204,43 @@ fn pull_marked(terminal: &mut DefaultTerminal, app: &mut App, out_dir: &Path) ->
     Ok(())
 }
 
+/// Enter（新建模式）：校验名字 → adb shell mkdir → 刷新当前目录并定位新
+/// 文件夹。名字非法或与现有条目同名时发中文提示、停留输入模式以便改名；
+/// adb 失败同样停留可重试；仅成功或 Esc 才退出输入模式。
+/// 不做"创建中"中间帧：mkdir 是单次 adb 往返（du -s 统计才需要先画一帧）。
+fn mkdir_confirm(app: &mut App) {
+    let name = app.create_name.clone();
+    if let Err(msg) = validate_dir_name(&name) {
+        app.push_status(StatusLine::Err(msg));
+        return;
+    }
+    // 同名预检：文件或目录都会让 mkdir 失败，本地一轮检查省一次 adb 往返
+    if app.entries.iter().any(|e| e.name == name) {
+        app.push_status(StatusLine::Err(format!("当前目录已存在同名条目「{name}」")));
+        return;
+    }
+    let path = join_path(&app.cwd, &name);
+    match adb::shell_mkdir(app.serial.as_deref(), &path) {
+        Ok(()) => {
+            app.creating = false;
+            app.create_name.clear();
+            if app.reload(&name) {
+                app.push_status(StatusLine::Ok(format!("已创建 {path}")));
+            }
+            // reload 失败：switch_dir 已写 error 横幅，列表停留原地
+        }
+        Err(err) => app.push_status(StatusLine::Err(format!("创建 {path} 失败：{err}"))),
+    }
+}
+
 /// 渲染一帧：列表区（自适应）/ 状态区（仅有内容时出现）/ 帮助栏（固定 1 行）。
 fn ui(frame: &mut Frame, app: &mut App) {
     let status = status_content(app);
-    let status_h: u16 = if status.is_empty() { 0 } else { (status.len() + 2) as u16 };
+    let status_h: u16 = if status.is_empty() {
+        0
+    } else {
+        (status.len() + 2) as u16
+    };
     let chunks = Layout::vertical([
         Constraint::Min(0),
         Constraint::Length(status_h),
@@ -184,7 +252,7 @@ fn ui(frame: &mut Frame, app: &mut App) {
     if !status.is_empty() {
         render_status(frame, status, chunks[1], app.error.is_some());
     }
-    render_help(frame, chunks[2], app.searching);
+    render_help(frame, chunks[2], help_text(app.creating, app.searching));
 }
 
 /// 汇总状态区内容：错误横幅、逐条状态行（按 [`StatusLine`] 变体定前缀/颜色）、
@@ -200,9 +268,10 @@ fn status_content(app: &App) -> Vec<Line<'static>> {
     }
     for line in &app.status {
         match line {
-            StatusLine::Warn(msg) => {
-                lines.push(Line::from(Span::styled(msg.clone(), Style::new().fg(Color::Yellow))))
-            }
+            StatusLine::Warn(msg) => lines.push(Line::from(Span::styled(
+                msg.clone(),
+                Style::new().fg(Color::Yellow),
+            ))),
             StatusLine::Ok(msg) => lines.push(Line::from(vec![
                 Span::styled("✓ ", Style::new().fg(Color::Green)),
                 Span::raw(msg.clone()),
@@ -224,10 +293,17 @@ fn status_content(app: &App) -> Vec<Line<'static>> {
 fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
     let vis = app.visible();
     let mut title = format!(" {} ── 已标记 {}", app.cwd, app.marked.len());
+    if app.creating {
+        title.push_str(&format!(" · 新建:{}▏", app.create_name));
+    }
     if app.searching || app.filter.is_some() {
         let caret = if app.searching { "▏" } else { "" };
         let word = app.filter.as_deref().unwrap_or("");
-        title.push_str(&format!(" · 筛选:{word}{caret} ({}/{})", vis.len(), app.entries.len()));
+        title.push_str(&format!(
+            " · 筛选:{word}{caret} ({}/{})",
+            vis.len(),
+            app.entries.len()
+        ));
     }
     title.push_str(&format!(
         " · 排序:{}{}",
@@ -242,7 +318,9 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
             "(空目录)"
         };
         frame.render_widget(
-            Paragraph::new(hint).style(Style::new().fg(Color::DarkGray)).block(block),
+            Paragraph::new(hint)
+                .style(Style::new().fg(Color::DarkGray))
+                .block(block),
             area,
         );
         return;
@@ -263,18 +341,35 @@ fn render_list(frame: &mut Frame, app: &mut App, area: Rect) {
 
 /// 渲染状态区：标题按内容区分（有错误显示"错误"，否则"拉取结果"）。
 fn render_status(frame: &mut Frame, lines: Vec<Line<'static>>, area: Rect, is_error: bool) {
-    let title = if is_error { " 错误 " } else { " 拉取结果 " };
-    frame.render_widget(Paragraph::new(lines).block(Block::bordered().title(title)), area);
+    let title = if is_error {
+        " 错误 "
+    } else {
+        " 拉取结果 "
+    };
+    frame.render_widget(
+        Paragraph::new(lines).block(Block::bordered().title(title)),
+        area,
+    );
 }
 
-/// 渲染底部帮助栏：浏览模式与筛选输入模式各一版。
-fn render_help(frame: &mut Frame, area: Rect, searching: bool) {
-    let text = if searching {
+/// 帮助栏文案：浏览 / 筛选输入 / 新建输入三版（纯函数，可单测）。
+/// 事件循环保证 creating 与 searching 互斥，creating 判断在前。
+fn help_text(creating: bool, searching: bool) -> &'static str {
+    if creating {
+        "输入新文件夹名（可含空格） · Enter 创建 · Esc 取消 · Ctrl-C 退出"
+    } else if searching {
         "输入筛选词（大小写不敏感） · ↑↓ 移动 · Enter 保留筛选 · Esc 清除 · Ctrl-C 退出"
     } else {
-        "↑↓ 移动 · → 进入 · ←/⌫ 返回 · / 筛选 · S/s 排序 · O/o 方向 · Space 标记 · Enter 拉取 · q/Esc 退出（拉取中=取消）"
-    };
-    frame.render_widget(Paragraph::new(text).style(Style::new().fg(Color::DarkGray)), area);
+        "↑↓ 移动 · → 进入 · ←/⌫ 返回 · / 筛选 · S/s 排序 · O/o 方向 · M/m 新建 · Space 标记 · Enter 拉取 · q/Esc 退出（拉取中=取消）"
+    }
+}
+
+/// 渲染底部帮助栏，文案由 [`help_text`] 按当前模式选择。
+fn render_help(frame: &mut Frame, area: Rect, text: &str) {
+    frame.render_widget(
+        Paragraph::new(text).style(Style::new().fg(Color::DarkGray)),
+        area,
+    );
 }
 
 /// 生成列表行 `▸ [✓] name/  1.2 MB[ · 2024-06-01 08:15]`（纯函数，可单测）。
@@ -336,6 +431,19 @@ mod tests {
     }
 
     #[test]
+    fn help_text_covers_three_input_modes() {
+        // 浏览版含全部按键提示（含新建）
+        let browse = help_text(false, false);
+        assert!(browse.contains("M/m 新建"));
+        assert!(browse.contains("Enter 拉取"));
+        // 筛选版
+        assert!(help_text(false, true).contains("筛选词"));
+        // 新建版优先于筛选（事件循环保证两者互斥，此处为防御性排序）
+        assert!(help_text(true, false).contains("新文件夹名"));
+        assert!(help_text(true, true).contains("新文件夹名"));
+    }
+
+    #[test]
     fn format_row_shows_marks_and_suffixes() {
         let text = |line: &Line<'_>| -> String {
             line.spans.iter().map(|s| s.content.to_string()).collect()
@@ -352,7 +460,10 @@ mod tests {
         assert!(!row.contains("notes.txt/"));
         assert!(row.contains("12 B"));
         // 日期列仅在日期排序时展示
-        let file = Entry { date: "2024-06-01 08:15".into(), ..file };
+        let file = Entry {
+            date: "2024-06-01 08:15".into(),
+            ..file
+        };
         assert!(!text(&format_row(&file, false, false, false)).contains("2024-"));
         assert!(text(&format_row(&file, false, false, true)).contains(" · 2024-06-01 08:15"));
     }

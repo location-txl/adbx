@@ -139,7 +139,13 @@ fn parse_ls_line(line: &str) -> Option<Entry> {
     if matches!(name, "." | "..") || name.bytes().any(|b| b.is_ascii_control()) {
         return None;
     }
-    Some(Entry { name: name.to_owned(), kind, size, date, mtime })
+    Some(Entry {
+        name: name.to_owned(),
+        kind,
+        size,
+        date,
+        mtime,
+    })
 }
 
 /// 把 `ls -l` 的日期/时间两字段折算为可比较的数值键（纯函数，可单测）。
@@ -156,13 +162,21 @@ fn parse_mtime_key(date: &str, time: &str) -> u64 {
     let key = |y: u64, mo: u64, d: u64, h: u64, mi: u64| {
         y * 100_000_000 + mo * 1_000_000 + d * 10_000 + h * 100 + mi
     };
-    let Some(ymd) = numeric_parts(date, '-') else { return 0 };
+    let Some(ymd) = numeric_parts(date, '-') else {
+        return 0;
+    };
     let [y, mo, d] = ymd[..] else { return 0 };
     // time 位是纯数字：只可能是 4 位年份的旧格式变体，按该年年初近似
     if let Ok(year) = time.parse::<u64>() {
-        return if (1000..10000).contains(&year) { key(year, 1, 1, 0, 0) } else { 0 };
+        return if (1000..10000).contains(&year) {
+            key(year, 1, 1, 0, 0)
+        } else {
+            0
+        };
     }
-    let Some(hms) = numeric_parts(time, ':') else { return 0 };
+    let Some(hms) = numeric_parts(time, ':') else {
+        return 0;
+    };
     if hms.len() < 2 {
         return 0;
     }
@@ -229,7 +243,13 @@ pub(super) fn visible_indices(entries: &[Entry], filter: Option<&str>) -> Vec<us
 /// 造测试条目：date 置空串（不参与断言），mtime 由调用方给。
 #[cfg(test)]
 pub(super) fn mk(name: &str, kind: EntryKind, size: u64, mtime: u64) -> Entry {
-    Entry { name: name.to_owned(), kind, size, date: String::new(), mtime }
+    Entry {
+        name: name.to_owned(),
+        kind,
+        size,
+        date: String::new(),
+        mtime,
+    }
 }
 
 #[cfg(test)]
@@ -407,7 +427,9 @@ lrwxrwxrwx 1 root root 21 2024-05-01 12:40 loc_kernel -> /sdcard/DCIM\r
             mk("small", EntryKind::File, 1, 0),
             mk("zdir", EntryKind::Dir, 99, 0),
         ];
-        fn names(es: &[Entry]) -> Vec<&str> { es.iter().map(|e| e.name.as_str()).collect() }
+        fn names(es: &[Entry]) -> Vec<&str> {
+            es.iter().map(|e| e.name.as_str()).collect()
+        }
         sort_entries(&mut entries, SortKey::Size, false);
         assert_eq!(names(&entries), ["zdir", "small", "big"]);
         sort_entries(&mut entries, SortKey::Size, true);
@@ -422,13 +444,21 @@ lrwxrwxrwx 1 root root 21 2024-05-01 12:40 loc_kernel -> /sdcard/DCIM\r
             mk("unknown.txt", EntryKind::File, 1, 0),
             mk("mid.txt", EntryKind::File, 1, 2023_0601_0000),
         ];
-        fn names(es: &[Entry]) -> Vec<&str> { es.iter().map(|e| e.name.as_str()).collect() }
+        fn names(es: &[Entry]) -> Vec<&str> {
+            es.iter().map(|e| e.name.as_str()).collect()
+        }
         // 降序（自然方向）：新在前；mtime 0 视为最旧落末尾
         sort_entries(&mut entries, SortKey::Date, true);
-        assert_eq!(names(&entries), ["new.txt", "mid.txt", "old.txt", "unknown.txt"]);
+        assert_eq!(
+            names(&entries),
+            ["new.txt", "mid.txt", "old.txt", "unknown.txt"]
+        );
         // 升序：旧在前
         sort_entries(&mut entries, SortKey::Date, false);
-        assert_eq!(names(&entries), ["unknown.txt", "old.txt", "mid.txt", "new.txt"]);
+        assert_eq!(
+            names(&entries),
+            ["unknown.txt", "old.txt", "mid.txt", "new.txt"]
+        );
     }
 
     #[test]

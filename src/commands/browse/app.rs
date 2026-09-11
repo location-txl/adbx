@@ -1,7 +1,7 @@
 //! App 状态机与目录加载。
 //!
 //! `load_dir` 是本命令唯一的 `adb ls` 出口；除 `App::new` 与
-//! `App::switch_dir` 会发起 adb 调用外，其余方法都是纯状态变更。
+//! `App::switch_dir`/`App::reload` 会发起 adb 调用外，其余方法都是纯状态变更。
 
 use std::collections::HashSet;
 
@@ -22,7 +22,7 @@ pub(super) enum StatusLine {
     Warn(String),
 }
 
-/// TUI 会话状态。除 `switch_dir`/`new` 会发起 adb 调用外，其余方法都是纯状态变更。
+/// TUI 会话状态。除 `switch_dir`/`reload`/`new` 会发起 adb 调用外，其余方法都是纯状态变更。
 pub(super) struct App {
     /// 目标设备 serial，透传给 adb
     pub(super) serial: Option<String>,
@@ -52,6 +52,10 @@ pub(super) struct App {
     pub(super) filter: Option<String>,
     /// 是否处于筛选输入模式（Enter 保留筛选退出，Esc 清除筛选退出）
     pub(super) searching: bool,
+    /// 是否处于新建文件夹输入模式（M 进入；Enter 确认创建在 tui 层，Esc 取消）
+    pub(super) creating: bool,
+    /// 新建文件夹的待输入名字（进入输入模式时清空）
+    pub(super) create_name: String,
 }
 
 impl App {
@@ -73,6 +77,8 @@ impl App {
             desc: false,
             filter: None,
             searching: false,
+            creating: false,
+            create_name: String::new(),
         };
         // 首次加载复用 switch_dir（加载/排序/光标初始化只此一份），失败转 Err
         if !app.switch_dir(cwd, 0) {
@@ -103,7 +109,8 @@ impl App {
                 self.filter = None;
                 self.searching = false;
                 // 光标尽量落在期望行；目录变空则取消选中
-                self.state.select((!self.entries.is_empty()).then(|| cursor.min(self.entries.len() - 1)));
+                self.state
+                    .select((!self.entries.is_empty()).then(|| cursor.min(self.entries.len() - 1)));
                 true
             }
             Err(err) => {
@@ -113,13 +120,29 @@ impl App {
         }
     }
 
+    /// 重新加载当前目录并把光标定位到名为 `select_name` 的条目（新建文件夹
+    /// 成功后刷新并定位用）。转发 [`Self::switch_dir`]，因此同样会清除筛选、
+    /// 不动 history；加载失败停留原地并写 error，返回 false。
+    pub(super) fn reload(&mut self, select_name: &str) -> bool {
+        let cwd = self.cwd.clone();
+        if !self.switch_dir(&cwd, 0) {
+            return false;
+        }
+        self.select_by_name(select_name);
+        true
+    }
+
     /// →：进入光标所在目录或目录型符号链接（Android 顶层 `/sdcard`、`/etc`
     /// 等多为 symlink，不放行则从根目录无处可去）。目录型 symlink 靠
     /// shell_list_dir 的尾部 `/` 正确列出内容；指向文件的 symlink 进入时
     /// ls 自然报错、经 switch_dir 失败路径停留原地。成功才记录历史。
     pub(super) fn enter_selected(&mut self) {
-        let Some(i) = self.selected_entry_index() else { return };
-        let Some(entry) = self.entries.get(i) else { return };
+        let Some(i) = self.selected_entry_index() else {
+            return;
+        };
+        let Some(entry) = self.entries.get(i) else {
+            return;
+        };
         if !matches!(entry.kind, EntryKind::Dir | EntryKind::Symlink) {
             self.error = Some(format!("「{}」不是目录，→ 仅用于进入文件夹", entry.name));
             return;
@@ -153,13 +176,18 @@ impl App {
             return;
         }
         let current = self.state.selected().unwrap_or(0) as i32;
-        self.state.select(Some((current + delta).clamp(0, len as i32 - 1) as usize));
+        self.state
+            .select(Some((current + delta).clamp(0, len as i32 - 1) as usize));
     }
 
     /// Space：标记/取消标记当前条目（设备端绝对路径进出 marked 集合）。
     pub(super) fn toggle_mark(&mut self) {
-        let Some(i) = self.selected_entry_index() else { return };
-        let Some(entry) = self.entries.get(i) else { return };
+        let Some(i) = self.selected_entry_index() else {
+            return;
+        };
+        let Some(entry) = self.entries.get(i) else {
+            return;
+        };
         let path = join_path(&self.cwd, &entry.name);
         if !self.marked.remove(&path) {
             self.marked.insert(path);
@@ -185,6 +213,14 @@ impl App {
             0 => None,
             _ => Some(self.state.selected().map_or(0, |s| s.min(len - 1))),
         });
+    }
+
+    /// 把光标定位到可见视图中名为 name 的条目（刷新后定位新建文件夹用；
+    /// 与 resort 同理以名字定位、落在可见位坐标）；找不到则光标不动。
+    fn select_by_name(&mut self, name: &str) {
+        if let Some(pos) = self.visible().iter().position(|&i| self.entries[i].name == name) {
+            self.state.select(Some(pos));
+        }
     }
 
     /// `/`：进入筛选输入模式（已有筛选词则继续编辑）。
@@ -222,6 +258,28 @@ impl App {
         }
     }
 
+    /// `M`：进入新建文件夹输入模式（清空上次未完成的名字）。
+    pub(super) fn create_begin(&mut self) {
+        self.creating = true;
+        self.create_name.clear();
+    }
+
+    /// 新建模式输入一个字符（空格是合法的文件夹名字符）。
+    pub(super) fn create_input(&mut self, c: char) {
+        self.create_name.push(c);
+    }
+
+    /// 新建模式退格。
+    pub(super) fn create_del_char(&mut self) {
+        self.create_name.pop();
+    }
+
+    /// Esc：退出新建模式并丢弃未完成的名字。
+    pub(super) fn create_cancel(&mut self) {
+        self.creating = false;
+        self.create_name.clear();
+    }
+
     /// `S`：切换排序键并重置为该键自然方向，重排当前列表。
     pub(super) fn cycle_sort(&mut self) {
         self.sort = self.sort.cycle();
@@ -238,13 +296,16 @@ impl App {
     /// 按当前键与方向重排，并让光标跟随原条目到新位置（排序是原地换位，
     /// 下标不跨排序存活，故以目录内唯一的文件名定位原条目）。
     fn resort(&mut self) {
-        let current = self.selected_entry_index().map(|i| self.entries[i].name.clone());
+        let current = self
+            .selected_entry_index()
+            .map(|i| self.entries[i].name.clone());
         sort_entries(&mut self.entries, self.sort, self.desc);
         let vis = self.visible();
         self.state.select(match current {
-            Some(name) => {
-                vis.iter().position(|&i| self.entries[i].name == name).or(Some(0))
-            }
+            Some(name) => vis
+                .iter()
+                .position(|&i| self.entries[i].name == name)
+                .or(Some(0)),
             None => (!vis.is_empty()).then_some(0),
         });
     }
@@ -275,6 +336,8 @@ pub(super) fn app_with_entries(entries: Vec<Entry>) -> App {
         desc: false,
         filter: None,
         searching: false,
+        creating: false,
+        create_name: String::new(),
     }
 }
 
@@ -329,6 +392,46 @@ mod tests {
         assert!(!app.searching);
         assert_eq!(app.filter, None);
         assert_eq!(app.visible().len(), 3);
+    }
+
+    #[test]
+    fn create_input_builds_name_and_cancel_resets() {
+        let mut app = app_with_entries(vec![]);
+        app.create_begin();
+        assert!(app.creating);
+        // 空格是合法名字符，逐字输入"新建 目录"
+        for c in "新建 目录".chars() {
+            app.create_input(c);
+        }
+        assert_eq!(app.create_name, "新建 目录");
+        // 退格删掉末字，再 Esc 取消丢弃全部
+        app.create_del_char();
+        assert_eq!(app.create_name, "新建 目");
+        app.create_cancel();
+        assert!(!app.creating);
+        assert_eq!(app.create_name, "");
+        // 再次进入时残留不带回输入模式
+        app.create_begin();
+        assert_eq!(app.create_name, "");
+    }
+
+    #[test]
+    fn select_by_name_targets_visible_position() {
+        let mut app = app_with_entries(vec![
+            mk("DCIM", EntryKind::Dir, 0, 0),
+            mk("Music", EntryKind::Dir, 0, 0),
+            mk("notes.txt", EntryKind::File, 0, 0),
+        ]);
+        app.select_by_name("notes.txt");
+        assert_eq!(app.state.selected(), Some(2));
+        // 筛选视图下定位落在可见位坐标而非真实下标
+        app.filter = Some("txt".to_owned());
+        app.select_by_name("notes.txt");
+        assert_eq!(app.state.selected(), Some(0));
+        assert_eq!(app.selected_entry_index(), Some(2));
+        // 名字不存在时光标不动
+        app.select_by_name("zzz");
+        assert_eq!(app.state.selected(), Some(0));
     }
 
     #[test]

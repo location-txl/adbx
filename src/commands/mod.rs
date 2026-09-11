@@ -4,6 +4,7 @@ pub mod browse;
 pub mod clear;
 pub mod doctor;
 pub mod info;
+pub mod passthrough;
 pub mod restart;
 pub mod stop;
 pub mod uninstall;

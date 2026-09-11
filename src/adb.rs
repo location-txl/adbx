@@ -4,6 +4,7 @@
 //! 供各子命令复用，避免散落各处的 Command 拼装。
 
 use anyhow::{Context, Result};
+use std::ffi::{OsStr, OsString};
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -32,14 +33,21 @@ pub fn run_adb(serial: Option<&str>, args: &[&str]) -> Result<String> {
 ///
 /// 供需要检查 stderr 的调用方使用（如 [`uninstall`]：部分 Android 的
 /// `pm uninstall` 失败时退出码仍为 0，只把报错打在 stderr），其余命令用 [`run_adb`] 即可。
-/// 拼装 adb 命令并完成 `-s <serial>` 设备选择转发，供本文件各调用点复用，
-/// 保证设备选择行为只有一份实现。
-fn adb_command(serial: Option<&str>) -> Command {
+/// 拼装 adb 命令并完成 `-s <serial>` 设备选择转发（OsStr 版，唯一实现）。
+///
+/// 透传路径的参数是用户原始 OsString（可能非 UTF-8），设备选择的唯一
+/// 实现放在这里；str 版 [`adb_command`] 只是它的便捷封装。
+fn adb_command_os(serial: Option<&OsStr>) -> Command {
     let mut cmd = Command::new("adb");
     if let Some(serial) = serial {
-        cmd.args(["-s", serial]);
+        cmd.arg("-s").arg(serial);
     }
     cmd
+}
+
+/// 拼装 adb 命令，供本文件各调用点复用，保证设备选择行为只有一份实现。
+fn adb_command(serial: Option<&str>) -> Command {
+    adb_command_os(serial.map(OsStr::new))
 }
 
 fn run_adb_raw(serial: Option<&str>, args: &[&str]) -> Result<(String, String)> {
@@ -58,6 +66,35 @@ fn run_adb_raw(serial: Option<&str>, args: &[&str]) -> Result<(String, String)> 
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
     ))
+}
+
+/// 原样透传执行 adb：以 adb 子进程替换本进程，成功时本函数不返回。
+///
+/// 供未知子命令透传（passthrough）使用。与 [`run_adb`] 的捕获式执行不同，
+/// 透传要求 stdio 直接继承终端——`adb shell` 交互、`logcat` 流式输出、
+/// 颜色/TTY 全部正常；Ctrl+C 等信号直达 adb；退出码原样返回给调用脚本
+/// （`adb shell false` 的非零码不会被吞掉）。Unix 下用 exec 进程替换实现
+/// （adbx 进程被 adb 替换，零额外开销），其他平台退化为 status + exit。
+/// `serial` 为路由层捕获归一化的值，以 `-s <serial>` 前置；`args` 为用户
+/// 原始参数（OsString，不二次解释）。adb 不存在时返回 Err（提示安装）。
+pub fn exec_adb(serial: Option<&OsStr>, args: &[OsString]) -> Result<()> {
+    let mut cmd = adb_command_os(serial);
+    cmd.args(args);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // exec 成功后本进程即 adb，永不返回；仅启动失败（如 adb 缺失）时返回 Err
+        let err = cmd.exec();
+        anyhow::bail!("无法启动 adb，请确认已安装并在 PATH 中：{err}");
+    }
+    #[cfg(not(unix))]
+    {
+        let status = cmd
+            .status()
+            .context("无法启动 adb，请确认已安装并在 PATH 中")?;
+        // 退出码原样透传给调用方，信号终止（无码）按 1 处理
+        std::process::exit(status.code().unwrap_or(1))
+    }
 }
 
 /// 从 `adb version` 输出中解析版本号。
@@ -115,7 +152,15 @@ pub fn force_stop(serial: Option<&str>, package: &str) -> Result<()> {
 pub fn launch_app(serial: Option<&str>, package: &str) -> Result<()> {
     run_adb(
         serial,
-        &["shell", "monkey", "-p", package, "-c", "android.intent.category.LAUNCHER", "1"],
+        &[
+            "shell",
+            "monkey",
+            "-p",
+            package,
+            "-c",
+            "android.intent.category.LAUNCHER",
+            "1",
+        ],
     )?;
     Ok(())
 }
@@ -192,6 +237,21 @@ pub fn shell_list_dir(serial: Option<&str>, path: &str) -> Result<String> {
     run_adb(serial, &["shell", "ls", "-l", &shell_quote(&path)])
 }
 
+/// 在设备端创建目录（`adb shell mkdir <path>`，单层，不加 -p）。
+///
+/// * `path` - 设备端绝对路径；内部已做 shell 转义，含空格等特殊字符安全
+///
+/// 除退出码外还校验 stderr：mkdir 成功时 stderr 恒空，失败只向 stderr 输出
+/// 报错（仿 [`uninstall`]，兜住部分设备 adb shell 不回传退出码的情形）。
+/// 目标已存在、无权限等失败返回 Err 并透传设备端报错原文。
+pub fn shell_mkdir(serial: Option<&str>, path: &str) -> Result<()> {
+    let (_, stderr) = run_adb_raw(serial, &["shell", "mkdir", &shell_quote(path)])?;
+    if !stderr.trim().is_empty() {
+        anyhow::bail!("mkdir {path} 失败：{}", stderr.trim());
+    }
+    Ok(())
+}
+
 /// 解析 `du -s` 多路径输出（纯函数，可单测）。
 ///
 /// toybox 行格式 `KB数\t路径`（路径与入参一致，可含中文/空格）；按路径回填到
@@ -200,8 +260,12 @@ pub fn shell_list_dir(serial: Option<&str>, path: &str) -> Result<String> {
 fn parse_du_lines(output: &str, paths: &[String]) -> Vec<u64> {
     let mut sizes = vec![0u64; paths.len()];
     for line in output.lines() {
-        let Some((kb, path)) = line.split_once('\t') else { continue };
-        let Ok(kb) = kb.trim().parse::<u64>() else { continue };
+        let Some((kb, path)) = line.split_once('\t') else {
+            continue;
+        };
+        let Ok(kb) = kb.trim().parse::<u64>() else {
+            continue;
+        };
         if let Some(i) = paths.iter().position(|p| p == path) {
             sizes[i] = kb.saturating_mul(1024);
         }
@@ -342,7 +406,10 @@ fn tree_size(path: &Path) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{du_totals, is_uninstall_success, parse_adb_version, parse_du_lines, pull_with_progress, shell_quote, tree_size};
+    use super::{
+        du_totals, is_uninstall_success, parse_adb_version, parse_du_lines, pull_with_progress,
+        shell_quote, tree_size,
+    };
 
     #[test]
     fn parses_standard_version_output() {
@@ -386,7 +453,10 @@ mod tests {
     #[test]
     fn uninstall_failure_on_stdout_should_fail() {
         // 部分版本的 pm 把 Failure 打在 stdout（同样退出码 0）
-        assert!(!is_uninstall_success("Failure [DELETE_FAILED_INTERNAL_ERROR]\n", ""));
+        assert!(!is_uninstall_success(
+            "Failure [DELETE_FAILED_INTERNAL_ERROR]\n",
+            ""
+        ));
     }
 
     /// 真机回归：不存在的包卸载失败时，uninstall 必须返回 Err（而非误报成功）。
@@ -401,10 +471,15 @@ mod tests {
     #[test]
     fn parses_du_lines_with_tab_paths() {
         // 真机 toybox du -s 多路径输出（\r\n 换行、路径可含中文），行序与入参无关
-        let paths: Vec<String> =
-            ["/sdcard/DCIM", "/sdcard/Download/微信.apk", "/gone"].map(String::from).into_iter().collect();
+        let paths: Vec<String> = ["/sdcard/DCIM", "/sdcard/Download/微信.apk", "/gone"]
+            .map(String::from)
+            .into_iter()
+            .collect();
         let out = "265192\t/sdcard/Download/微信.apk\r\n4\t/sdcard/DCIM\r\n";
-        assert_eq!(parse_du_lines(out, &paths), vec![4 * 1024, 265192 * 1024, 0]);
+        assert_eq!(
+            parse_du_lines(out, &paths),
+            vec![4 * 1024, 265192 * 1024, 0]
+        );
     }
 
     #[test]
@@ -437,13 +512,23 @@ mod tests {
         let remote = "/data/local/tmp/adbx_pct_test.bin";
         super::run_adb(
             None,
-            &["shell", "dd", "if=/dev/zero", &format!("of={remote}"), "bs=1048576", "count=10"],
+            &[
+                "shell",
+                "dd",
+                "if=/dev/zero",
+                &format!("of={remote}"),
+                "bs=1048576",
+                "count=10",
+            ],
         )
         .unwrap();
 
         let sizes = du_totals(None, &[remote.to_owned()]);
         // du 按磁盘块统计，允许小幅偏差
-        assert!(sizes[0].abs_diff(10 * 1024 * 1024) < 64 * 1024, "du 结果 {sizes:?}");
+        assert!(
+            sizes[0].abs_diff(10 * 1024 * 1024) < 64 * 1024,
+            "du 结果 {sizes:?}"
+        );
 
         let out_dir = std::env::temp_dir().join(format!("adbx_pct_out_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&out_dir);
@@ -451,12 +536,21 @@ mod tests {
 
         let mut percents = Vec::new();
         let watch = out_dir.join("adbx_pct_test.bin");
-        let done =
-            pull_with_progress(None, remote, &out_dir, sizes[0], || false, |p| percents.push(p))
-                .unwrap();
+        let done = pull_with_progress(
+            None,
+            remote,
+            &out_dir,
+            sizes[0],
+            || false,
+            |p| percents.push(p),
+        )
+        .unwrap();
         assert!(done, "未取消时应报告完成");
         assert_eq!(percents.last(), Some(&100));
-        assert!(percents.windows(2).all(|w| w[0] <= w[1]), "进度非单调：{percents:?}");
+        assert!(
+            percents.windows(2).all(|w| w[0] <= w[1]),
+            "进度非单调：{percents:?}"
+        );
         assert_eq!(std::fs::metadata(&watch).unwrap().len(), 10 * 1024 * 1024);
 
         super::run_adb(None, &["shell", "rm", remote]).unwrap();
@@ -472,7 +566,14 @@ mod tests {
         let remote = "/data/local/tmp/adbx_cancel_test.bin";
         super::run_adb(
             None,
-            &["shell", "dd", "if=/dev/zero", &format!("of={remote}"), "bs=1048576", "count=100"],
+            &[
+                "shell",
+                "dd",
+                "if=/dev/zero",
+                &format!("of={remote}"),
+                "bs=1048576",
+                "count=100",
+            ],
         )
         .unwrap();
 
@@ -498,5 +599,22 @@ mod tests {
 
         super::run_adb(None, &["shell", "rm", remote]).unwrap();
         let _ = std::fs::remove_dir_all(&out_dir);
+    }
+
+    /// 真机回归：mkdir 创建含空格/中文名目录成功、可被 ls 列出、重复创建报错
+    /// （验证退出码与 stderr 双重校验）；单层语义（父目录不存在时不递归）。
+    #[test]
+    #[ignore = "需要连接一台 adb 设备"]
+    fn mkdir_on_real_device() {
+        let base = "/data/local/tmp/adbx_mkdir_test";
+        let _ = super::run_adb(None, &["shell", "rm", "-rf", &shell_quote(base)]);
+        // 父目录先建：不加 -p，单层 mkdir 不递归创建
+        super::shell_mkdir(None, base).unwrap();
+        let dir = format!("{base}/新建 目录");
+        super::shell_mkdir(None, &dir).unwrap();
+        assert!(super::shell_list_dir(None, base).unwrap().contains("新建 目录"));
+        // 无 -p 的单层 mkdir：已存在必须报错而非静默成功
+        assert!(super::shell_mkdir(None, &dir).is_err());
+        super::run_adb(None, &["shell", "rm", "-rf", &shell_quote(base)]).unwrap();
     }
 }

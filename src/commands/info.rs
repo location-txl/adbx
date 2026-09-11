@@ -33,8 +33,14 @@ fn print_info(serial: Option<&str>, package: &str) -> Result<()> {
     let info = parse_version_info(&dump);
     println!("✓ {package}");
     // 版本字段缺失（老 ROM / 厂商定制输出格式异常）时降级显示"未知"，不报错
-    println!("    versionName: {}", info.version_name.as_deref().unwrap_or("未知"));
-    println!("    versionCode: {}", info.version_code.as_deref().unwrap_or("未知"));
+    println!(
+        "    versionName: {}",
+        info.version_name.as_deref().unwrap_or("未知")
+    );
+    println!(
+        "    versionCode: {}",
+        info.version_code.as_deref().unwrap_or("未知")
+    );
     Ok(())
 }
 
@@ -61,15 +67,28 @@ fn parse_version_info(dump: &str) -> VersionInfo {
         if version_code.is_none()
             && let Some(rest) = line.strip_prefix("versionCode=")
         {
-            version_code = Some(rest.split_whitespace().next().unwrap_or_default().to_owned());
+            version_code = Some(
+                rest.split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned(),
+            );
         }
         if version_name.is_none()
             && let Some(rest) = line.strip_prefix("versionName=")
         {
-            version_name = Some(rest.split_whitespace().next().unwrap_or_default().to_owned());
+            version_name = Some(
+                rest.split_whitespace()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned(),
+            );
         }
     }
-    VersionInfo { version_code, version_name }
+    VersionInfo {
+        version_code,
+        version_name,
+    }
 }
 
 #[cfg(test)]

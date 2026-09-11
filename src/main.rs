@@ -1,13 +1,24 @@
 //! adbx 命令行入口：clap 参数定义与子命令分发。
+//!
+//! clap 解析前先做透传路由（[`commands::passthrough`]）：未被 adbx
+//! 命中的子命令/旗标原样转发给 adb，adbx 是 adb 的超集。
+
+use std::ffi::OsString;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 use adbx::commands;
+use adbx::commands::passthrough::Route;
 
-/// adb 扩展 CLI：在 adb 之上提供模糊包名匹配等增强能力
+/// adb 扩展 CLI：在 adb 之上提供模糊包名匹配等增强能力；
+/// 未被识别的子命令/旗标会原样转发给 adb
 #[derive(Parser)]
-#[command(name = "adbx", version)]
+#[command(
+    name = "adbx",
+    version,
+    after_help = "未被识别的子命令/旗标将静默转发给 adb（stdio 与退出码一致）"
+)]
 struct Cli {
     /// 目标设备 serial，转发给 adb -s
     #[arg(short = 's', long, global = true)]
@@ -66,10 +77,25 @@ enum Command {
 }
 
 fn main() {
-    if let Err(err) = run() {
+    // clap 解析前先路由：未命中 adbx 子命令的调用原样透传给 adb
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
+    let result = match commands::passthrough::classify(&args, is_known_subcommand) {
+        Route::Forward { serial, rest } => commands::passthrough::run(serial.as_deref(), &rest),
+        Route::Own => run(),
+    };
+    if let Err(err) = result {
         eprintln!("✗ {err}");
         std::process::exit(1);
     }
+}
+
+/// 判断 token 是否为 adbx 已知子命令（含 clap 内建的 help 及其别名）。
+///
+/// 从 clap 定义运行时自省，新增子命令后无需维护第二份清单。
+fn is_known_subcommand(token: &str) -> bool {
+    Cli::command()
+        .get_subcommands()
+        .any(|sc| sc.get_name() == token || sc.get_all_aliases().any(|alias| alias == token))
 }
 
 /// 解析命令行参数并分发到对应子命令。
