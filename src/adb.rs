@@ -263,8 +263,8 @@ pub fn shell_mkdir(serial: Option<&str>, path: &str) -> Result<()> {
 /// * `path` - 设备端文件路径；通过设备端 shell 单引号转义，含空格和特殊字符安全
 /// * `max_bytes` - 调用方允许预览的最大字节数；多读一个字节用于判断文件是否超限
 ///
-/// 返回的字节可直接交给文本解码器或图片解码器。文件不存在、目标是目录、设备断开
-/// 或 adb 不可用时返回 Err；文件超过上限时由调用方根据返回长度决定是否拒绝展示。
+/// 返回的字节可直接交给文本解码器或图片解码器。文件不存在、目标不是普通文件、
+/// 设备断开或 adb 不可用时返回 Err；文件超过上限时由调用方根据返回长度决定是否拒绝展示。
 pub fn read_file(serial: Option<&str>, path: &str, max_bytes: usize) -> Result<Vec<u8>> {
     let read_limit = max_bytes.saturating_add(1);
     let command = read_file_command(path, max_bytes);
@@ -276,13 +276,14 @@ pub fn read_file(serial: Option<&str>, path: &str, max_bytes: usize) -> Result<V
 }
 
 /// 生成 Android 常见 `dd` 语法的读取命令；按块读取避免 `head -c` 在旧版 toybox 上不兼容。
+/// `test -f` 会在打开目标前拒绝目录、FIFO、TTY 等非普通文件，避免同步读取永久等待。
 /// `exec-out` 是原始字节流，必须丢弃 dd 的统计输出，避免污染预览内容。
 fn read_file_command(path: &str, max_bytes: usize) -> String {
     const BLOCK_SIZE: usize = 4096;
     let blocks = max_bytes.saturating_add(1).div_ceil(BLOCK_SIZE);
+    let quoted_path = shell_quote(path);
     format!(
-        "dd if={} bs={BLOCK_SIZE} count={blocks} 2>/dev/null",
-        shell_quote(path)
+        "test -f {quoted_path} || exit 1; dd if={quoted_path} bs={BLOCK_SIZE} count={blocks} 2>/dev/null"
     )
 }
 
@@ -470,7 +471,7 @@ mod tests {
         let command = read_file_command("/sdcard/My Files/notes.txt", 2 * 1024 * 1024);
         assert_eq!(
             command,
-            "dd if='/sdcard/My Files/notes.txt' bs=4096 count=513 2>/dev/null"
+            "test -f '/sdcard/My Files/notes.txt' || exit 1; dd if='/sdcard/My Files/notes.txt' bs=4096 count=513 2>/dev/null"
         );
     }
 
