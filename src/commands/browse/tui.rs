@@ -5,11 +5,13 @@
 //! [`super::app`] 的方法。
 
 use std::collections::HashSet;
+use std::io::Cursor;
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Result;
-use image::{RgbImage, imageops};
+use image::io::Reader as ImageReader;
+use image::{ImageFormat, RgbImage, imageops};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
@@ -24,6 +26,15 @@ use crate::adb;
 
 /// 单次预览最多读取的字节数；多读取一个字节用于识别超限文件。
 const MAX_PREVIEW_BYTES: usize = 2 * 1024 * 1024;
+
+/// 图片预览允许的单边最大尺寸；先于解码检查，避免声明尺寸过大时分配像素缓冲。
+const MAX_PREVIEW_IMAGE_DIMENSION: u32 = 4096;
+
+/// 图片预览允许的最大像素数；限制宽高乘积，覆盖高宽比极端的图片。
+const MAX_PREVIEW_IMAGE_PIXELS: u64 = 4 * 1024 * 1024;
+
+/// 图片解码器允许的最大累计分配；为解码中间缓冲和 RGB 转换保留有限空间。
+const MAX_PREVIEW_IMAGE_ALLOC: u64 = 64 * 1024 * 1024;
 
 /// 右侧预览面板的内容状态。
 enum Preview {
@@ -277,13 +288,14 @@ fn build_preview(name: String, path: String, bytes: Vec<u8>) -> Result<Preview> 
     if bytes.len() > MAX_PREVIEW_BYTES {
         anyhow::bail!("文件超过 2 MiB 预览上限");
     }
-    if let Ok(image) = image::load_from_memory(&bytes) {
+    if let Some((image, width, height)) = decode_image(&bytes)? {
         return Ok(Preview::Image(ImagePreview {
             name,
             path,
-            width: image.width(),
-            height: image.height(),
-            image: image.to_rgb8(),
+            width,
+            height,
+            // 消费 DynamicImage；RGB 输入可直接复用像素缓冲，避免 to_rgb8 的额外复制。
+            image: image.into_rgb8(),
         }));
     }
     if let Some(content) = decode_plain_text(&bytes) {
@@ -295,6 +307,56 @@ fn build_preview(name: String, path: String, bytes: Vec<u8>) -> Result<Preview> 
         }));
     }
     anyhow::bail!("只支持纯文本和 PNG/JPEG/GIF/BMP/WebP 图片")
+}
+
+/// 按格式识别并受限解码图片；无法识别为支持格式时返回 None，交给文本规则继续判断。
+///
+/// 先读取图片头部尺寸并检查宽高、像素数，再创建带分配上限的解码器。这样压缩数据很小
+/// 但声明为超大画布的图片不会先分配完整像素缓冲。
+fn decode_image(bytes: &[u8]) -> Result<Option<(image::DynamicImage, u32, u32)>> {
+    let Ok(format) = image::guess_format(bytes) else {
+        return Ok(None);
+    };
+    if !matches!(
+        format,
+        ImageFormat::Bmp
+            | ImageFormat::Gif
+            | ImageFormat::Jpeg
+            | ImageFormat::Png
+            | ImageFormat::WebP
+    ) {
+        return Ok(None);
+    }
+
+    let (width, height) = ImageReader::with_format(Cursor::new(bytes), format).into_dimensions()?;
+    validate_image_dimensions(width, height)?;
+
+    let mut limits = image::io::Limits::default();
+    limits.max_image_width = Some(MAX_PREVIEW_IMAGE_DIMENSION);
+    limits.max_image_height = Some(MAX_PREVIEW_IMAGE_DIMENSION);
+    limits.max_alloc = Some(MAX_PREVIEW_IMAGE_ALLOC);
+    let mut reader = ImageReader::with_format(Cursor::new(bytes), format);
+    reader.limits(limits);
+    Ok(Some((reader.decode()?, width, height)))
+}
+
+/// 校验图片声明尺寸，确保后续解码和 RGB 转换都落在预览资源预算内。
+fn validate_image_dimensions(width: u32, height: u32) -> Result<()> {
+    if width == 0 || height == 0 {
+        anyhow::bail!("图片尺寸无效");
+    }
+    if width > MAX_PREVIEW_IMAGE_DIMENSION || height > MAX_PREVIEW_IMAGE_DIMENSION {
+        anyhow::bail!(
+            "图片尺寸超过 {}×{} 预览上限",
+            MAX_PREVIEW_IMAGE_DIMENSION,
+            MAX_PREVIEW_IMAGE_DIMENSION
+        );
+    }
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels > MAX_PREVIEW_IMAGE_PIXELS {
+        anyhow::bail!("图片像素数超过 {} 像素预览上限", MAX_PREVIEW_IMAGE_PIXELS);
+    }
+    Ok(())
 }
 
 /// 解码没有终端控制字符的 UTF-8 文本，避免原样渲染二进制或 ANSI 转义序列。
@@ -790,6 +852,25 @@ mod tests {
             panic!("PNG bytes should create an image preview");
         };
         assert_eq!((image.width, image.height), (1, 1));
+    }
+
+    #[test]
+    fn rejects_image_with_too_many_pixels_before_decoding() {
+        // 黑色 PNG 具有很高压缩率，模拟“压缩数据很小但解码画布很大”的输入。
+        let source = RgbImage::from_pixel(2048, 2049, image::Rgb([0, 0, 0]));
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(source)
+            .write_to(&mut Cursor::new(&mut bytes), image::ImageOutputFormat::Png)
+            .unwrap();
+        let error = match build_preview(
+            "large.png".to_owned(),
+            "/sdcard/large.png".to_owned(),
+            bytes,
+        ) {
+            Ok(_) => panic!("images over the pixel limit should be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("像素数"));
     }
 
     #[test]
