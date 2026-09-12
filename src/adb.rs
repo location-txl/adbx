@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 use std::ffi::{OsStr, OsString};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -275,6 +275,54 @@ pub fn read_file(serial: Option<&str>, path: &str, max_bytes: usize) -> Result<V
     Ok(stdout)
 }
 
+/// 将字节流写回设备端普通文件（无 PTY 的 `adb shell -T`）。
+///
+/// * `path` - 设备端文件路径；通过设备端 shell 单引号转义，含空格和特殊字符安全
+/// * `bytes` - 要写入的完整文件内容；调用方负责在写入前完成大小和文本格式校验
+///
+/// 先写入目标同目录的临时文件，再用 `mv` 原子替换目标；写入或替换失败时不会截断
+/// 原文件。已有文件的权限、属主和属组会在替换前恢复，恢复失败则保留原文件。
+/// 设备端命令失败、写入管道断开或 adb 不可用时返回 Err。
+pub fn write_file(serial: Option<&str>, path: &str, bytes: &[u8]) -> Result<()> {
+    let command = write_file_command(path);
+    let mut child = adb_command(serial)
+        // `shell -T` 在旧版 Android（如 API 25）上也可用；`exec-in` 在这类设备上
+        // 可能静默丢弃 stdin，因此写回路径使用 shell protocol 的原始 stdin。
+        // adb 会拼接 shell 参数，完整脚本直接交给设备 shell，避免 sh -c 丢失参数边界。
+        .args(["shell", "-T", command.as_str()])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("无法启动 adb 写入进程，请确认已安装并在 PATH 中")?;
+
+    let mut stdin = child.stdin.take().context("获取 adb 写入管道失败")?;
+    if let Err(err) = stdin.write_all(bytes) {
+        drop(stdin);
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(err).with_context(|| format!("写入设备文件 {path} 失败"));
+    }
+    drop(stdin);
+
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("等待写入设备文件 {path} 完成失败"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "adb shell -T 写入 {path} 失败：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    if !output.stderr.is_empty() {
+        anyhow::bail!(
+            "adb shell -T 写入 {path} 失败：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 /// 生成 Android 常见 `dd` 语法的读取命令；按块读取避免 `head -c` 在旧版 toybox 上不兼容。
 /// `test -f` 会在打开目标前拒绝目录、FIFO、TTY 等非普通文件，避免同步读取永久等待。
 /// `exec-out` 是原始字节流，必须丢弃 dd 的统计输出，避免污染预览内容。
@@ -284,6 +332,32 @@ fn read_file_command(path: &str, max_bytes: usize) -> String {
     let quoted_path = shell_quote(path);
     format!(
         "test -f {quoted_path} || exit 1; dd if={quoted_path} bs={BLOCK_SIZE} count={blocks} 2>/dev/null"
+    )
+}
+
+/// 生成设备端安全覆盖写入命令；只有临时文件完整写入后才替换目标文件。
+fn write_file_command(path: &str) -> String {
+    let quoted_path = shell_quote(path);
+    // 写完后再恢复属性；chown 可能清除特殊权限位，因此 chmod 必须在它之后执行。
+    // 仅在属主/属组不同时 chown，避免共享存储对无必要的 chown 报权限错误。
+    format!(
+        r#"target={quoted_path}
+mode=
+if [ -L "$target" ]; then target=$(readlink -f "$target") || exit 1; fi
+if [ -e "$target" ]; then
+    test -f "$target" || exit 1
+    mode=$(stat -c %a "$target") || exit 1
+    owner=$(stat -c %u:%g "$target") || exit 1
+fi
+tmp=$(mktemp "$target.adbx.tmp.XXXXXX") || exit 1
+trap 'rm -f "$tmp"' 0
+cat > "$tmp" || exit 1
+if [ -n "$mode" ]; then
+    tmp_owner=$(stat -c %u:%g "$tmp") || exit 1
+    if [ "$owner" != "$tmp_owner" ]; then chown "$owner" "$tmp" || exit 1; fi
+    chmod "$mode" "$tmp" || exit 1
+fi
+mv -f "$tmp" "$target""#
     )
 }
 
@@ -443,7 +517,7 @@ fn tree_size(path: &Path) -> u64 {
 mod tests {
     use super::{
         du_totals, is_uninstall_success, parse_adb_version, parse_du_lines, pull_with_progress,
-        read_file_command, shell_quote, tree_size,
+        read_file_command, shell_quote, tree_size, write_file_command,
     };
 
     #[test]
@@ -473,6 +547,14 @@ mod tests {
             command,
             "test -f '/sdcard/My Files/notes.txt' || exit 1; dd if='/sdcard/My Files/notes.txt' bs=4096 count=513 2>/dev/null"
         );
+    }
+
+    #[test]
+    fn write_file_uses_atomic_temp_and_shell_quoted_path() {
+        let command = write_file_command("/sdcard/My Files/it's $notes.txt");
+        assert!(command.starts_with("target='/sdcard/My Files/it'\\''s $notes.txt'\n"));
+        assert!(command.contains("mktemp \"$target.adbx.tmp.XXXXXX\""));
+        assert!(command.ends_with("mv -f \"$tmp\" \"$target\""));
     }
 
     #[test]
@@ -656,9 +738,69 @@ mod tests {
         super::shell_mkdir(None, base).unwrap();
         let dir = format!("{base}/新建 目录");
         super::shell_mkdir(None, &dir).unwrap();
-        assert!(super::shell_list_dir(None, base).unwrap().contains("新建 目录"));
+        assert!(
+            super::shell_list_dir(None, base)
+                .unwrap()
+                .contains("新建 目录")
+        );
         // 无 -p 的单层 mkdir：已存在必须报错而非静默成功
         assert!(super::shell_mkdir(None, &dir).is_err());
         super::run_adb(None, &["shell", "rm", "-rf", &shell_quote(base)]).unwrap();
+    }
+
+    /// 真机回归：特殊字符路径完整写回，覆盖后保留权限与所有权，失败时保留原文件。
+    /// 手动运行：`cargo test write_file_on_real_device -- --ignored`
+    #[test]
+    #[ignore = "需要连接一台 adb 设备"]
+    fn write_file_on_real_device() {
+        let base = super::run_adb(
+            None,
+            &["shell", "mktemp -d /data/local/tmp/adbx_write_test.XXXXXX"],
+        )
+        .unwrap();
+        let base = base.trim();
+        let remote = format!("{base}/中文 it's $notes;*.txt");
+        let bytes = "第一行\r\n第二行\n".as_bytes();
+        let result = (|| {
+            super::write_file(None, &remote, b"original")?;
+            let setup = format!("chgrp 1007 {0} && chmod 6754 {0}", shell_quote(&remote),);
+            super::run_adb(None, &["shell", &setup])?;
+            let stat = format!("stat -c '%a %u:%g' {}", shell_quote(&remote));
+            let before = super::run_adb(None, &["shell", &stat])?;
+            super::write_file(None, &remote, bytes)?;
+            let (read_back, _) = super::run_adb_raw_bytes(
+                None,
+                &["shell", "-T", &format!("cat {}", shell_quote(&remote))],
+            )?;
+            assert_eq!(read_back, bytes);
+            assert_eq!(super::run_adb(None, &["shell", &stat])?, before);
+
+            // 模拟属性恢复失败，验证退出码、原内容和临时文件清理。
+            let fail = format!("chmod() {{ return 1; }}\n{}", write_file_command(&remote));
+            assert!(super::run_adb(None, &["shell", "-T", &fail]).is_err());
+            let (after_failure, _) = super::run_adb_raw_bytes(
+                None,
+                &["shell", "-T", &format!("cat {}", shell_quote(&remote))],
+            )?;
+            assert_eq!(after_failure, bytes);
+            let listing = super::shell_list_dir(None, base)?;
+            assert!(!listing.contains(".adbx.tmp."));
+
+            // 空文件覆盖也要保留原权限与所有权。
+            super::write_file(None, &remote, b"")?;
+            assert_eq!(super::run_adb(None, &["shell", &stat])?, before);
+            let empty = format!("test ! -s {}", shell_quote(&remote));
+            super::run_adb(None, &["shell", &empty])?;
+            for mode in ["644", "755"] {
+                let chmod = format!("chmod {mode} {}", shell_quote(&remote));
+                super::run_adb(None, &["shell", &chmod])?;
+                let before = super::run_adb(None, &["shell", &stat])?;
+                super::write_file(None, &remote, bytes)?;
+                assert_eq!(super::run_adb(None, &["shell", &stat])?, before);
+            }
+            anyhow::Result::<()>::Ok(())
+        })();
+        let _ = super::run_adb(None, &["shell", "rm", "-r", &shell_quote(base)]);
+        result.unwrap();
     }
 }

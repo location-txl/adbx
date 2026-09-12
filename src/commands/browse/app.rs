@@ -218,7 +218,11 @@ impl App {
     /// 把光标定位到可见视图中名为 name 的条目（刷新后定位新建文件夹用；
     /// 与 resort 同理以名字定位、落在可见位坐标）；找不到则光标不动。
     fn select_by_name(&mut self, name: &str) {
-        if let Some(pos) = self.visible().iter().position(|&i| self.entries[i].name == name) {
+        if let Some(pos) = self
+            .visible()
+            .iter()
+            .position(|&i| self.entries[i].name == name)
+        {
             self.state.select(Some(pos));
         }
     }

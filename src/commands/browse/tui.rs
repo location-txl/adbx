@@ -1,31 +1,44 @@
 //! 事件循环、批量拉取与渲染：`browse` 的 TUI 层。
 //!
-//! adb 调用只发生在批量拉取路径（`du -s` 统计与逐项 pull）与新建文件夹
-//! （`shell mkdir`，经 [`crate::adb`]）和文件预览；状态变更全部走
-//! [`super::app`] 的方法。
+//! adb 调用只发生在批量拉取路径（`du -s` 统计与逐项 pull）、新建文件夹
+//! （`shell mkdir`）、文件预览和文本编辑保存；所有设备 I/O 均经 [`crate::adb`]，
+//! 状态变更全部走 [`super::app`] 的方法。
 
 use std::collections::HashSet;
-use std::io::Cursor;
+use std::io::{self, Cursor};
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use image::io::Reader as ImageReader;
 use image::{ImageFormat, RgbImage, imageops};
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
+use ratatui::crossterm::execute;
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
+use tui_textarea::{CursorMove, TextArea};
+use unicode_width::UnicodeWidthChar;
 
 use super::app::{App, StatusLine};
 use super::model::{Entry, EntryKind, SortKey};
 use super::paths::{base_name, dup_base_names, filter_covered, join_path, validate_dir_name};
 use crate::adb;
 
-/// 单次预览最多读取的字节数；多读取一个字节用于识别超限文件。
-const MAX_PREVIEW_BYTES: usize = 2 * 1024 * 1024;
+/// 预览和编辑最多读取的字节数；多读取一个字节用于识别超限文件。
+const MAX_FILE_BYTES: usize = 10 * 1024 * 1024;
+
+/// 控件滚动坐标使用 u16；行尾光标的 `cursor + 1` 还需保留一列。
+const MAX_EDITOR_COLUMNS: usize = u16::MAX as usize - 1;
+/// 保证最后一行的光标及其后一行边界都能用 u16 表示。
+const MAX_EDITOR_LINES: usize = u16::MAX as usize;
+/// 容量校验与控件显示共用的制表位间隔。
+const EDITOR_TAB_LENGTH: u8 = 4;
 
 /// 图片预览允许的单边最大尺寸；先于解码检查，避免声明尺寸过大时分配像素缓冲。
 const MAX_PREVIEW_IMAGE_DIMENSION: u32 = 4096;
@@ -112,6 +125,89 @@ impl Preview {
     }
 }
 
+/// 编辑器保存时使用的换行符格式；混合换行文件按检测到的主格式写回。
+#[derive(Clone, Copy)]
+enum LineEnding {
+    /// Unix 风格换行符。
+    Lf,
+    /// Windows 风格换行符。
+    CrLf,
+}
+
+impl LineEnding {
+    /// 返回写回文件时使用的换行符字节。
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Lf => "\n",
+            Self::CrLf => "\r\n",
+        }
+    }
+}
+
+/// 一个远端文本文件的编辑会话。
+///
+/// 编辑器只保存打开时的原始快照，不在本地创建副本；写回前重新读取远端内容，
+/// 快照不一致时交给事件循环显示覆盖确认，避免静默覆盖其他端的修改。
+struct RemoteEditor {
+    /// 设备端绝对路径，用于重新读取和写回文件。
+    path: String,
+    /// 成熟的多行编辑控件，负责光标、Unicode、撤销/重做和鼠标滚动/定位。
+    textarea: TextArea<'static>,
+    /// 打开时或上次保存后的远端字节快照。
+    original_bytes: Vec<u8>,
+    /// 写回时保留的常见换行格式。
+    line_ending: LineEnding,
+    /// 本地编辑内容是否发生过修改。
+    dirty: bool,
+    /// 当前是否正在等待用户处理未保存或远端冲突提示。
+    prompt: Option<EditorPrompt>,
+}
+
+/// 编辑器需要用户确认的状态。
+#[derive(Clone, Copy)]
+enum EditorPrompt {
+    /// 按 Esc 离开时仍有本地修改。
+    Unsaved,
+    /// 保存前发现远端内容已变化。
+    RemoteChanged,
+}
+
+impl RemoteEditor {
+    /// 将编辑器当前内容按原换行格式序列化为待写回字节。
+    fn bytes(&self) -> Vec<u8> {
+        self.textarea
+            .lines()
+            .join(self.line_ending.as_str())
+            .into_bytes()
+    }
+}
+
+/// 一帧界面中可被鼠标命中的区域。
+#[derive(Clone, Copy, Default)]
+struct UiLayout {
+    /// 文件列表区域；编辑模式下为空。
+    list: Option<Rect>,
+    /// 编辑器区域；非编辑模式下为空。
+    editor: Option<Rect>,
+}
+
+/// 鼠标捕获的生命周期守卫，确保退出 browse 时恢复终端的鼠标模式。
+struct MouseCaptureGuard;
+
+impl MouseCaptureGuard {
+    /// 启用 crossterm 鼠标事件捕获。
+    fn enable() -> Result<Self> {
+        execute!(io::stdout(), EnableMouseCapture).context("启用鼠标捕获失败")?;
+        Ok(Self)
+    }
+}
+
+impl Drop for MouseCaptureGuard {
+    fn drop(&mut self) {
+        let _ = execute!(io::stdout(), DisableMouseCapture);
+    }
+}
+
 /// 是否退出/取消键（q/Esc/Ctrl-C），与底部帮助栏文案保持一致。
 fn is_quit_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
     matches!(code, KeyCode::Char('q') | KeyCode::Esc)
@@ -143,90 +239,474 @@ pub(super) fn event_loop(
     app: &mut App,
     out_dir: &Path,
 ) -> Result<()> {
-    let mut preview = None;
+    let _mouse_capture = MouseCaptureGuard::enable()?;
+    let mut preview: Option<Preview> = None;
+    let mut editor: Option<RemoteEditor> = None;
     loop {
-        terminal.draw(|frame| ui(frame, app, preview.as_ref()))?;
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-        // 只响应按下事件：kitty 键盘协议下 Release/Repeat 也会上报
-        if key.kind != KeyEventKind::Press {
-            continue;
-        }
-        // 筛选输入模式：可打印字符进筛选词（q 不再退出），Space 仍标记光标条目，
-        // Esc 清除筛选返回，仅 Ctrl-C 整体退出；→/← 不响应（先 Enter/Esc 回浏览模式）
-        if app.searching {
-            match key.code {
-                KeyCode::Esc => app.search_cancel(),
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    return Ok(());
-                }
-                KeyCode::Char(' ') => app.toggle_mark(),
-                KeyCode::Char(c) => app.search_input(c),
-                KeyCode::Backspace => app.search_del_char(),
-                KeyCode::Enter => app.search_commit(),
-                KeyCode::Up => app.move_cursor(-1),
-                KeyCode::Down => app.move_cursor(1),
-                _ => {}
-            }
-            continue;
-        }
-        // 新建文件夹输入模式：可打印字符（含空格）进名字，Enter 创建，Esc 取消；
-        // q 等可打印字符均为名字字符，仅 Ctrl-C 整体退出
-        if app.creating {
-            match key.code {
-                KeyCode::Esc => app.create_cancel(),
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    return Ok(());
-                }
-                KeyCode::Char(c) => app.create_input(c),
-                KeyCode::Backspace => app.create_del_char(),
-                KeyCode::Enter => mkdir_confirm(app),
-                _ => {}
-            }
-            continue;
-        }
-        match key.code {
-            KeyCode::Up => app.move_cursor(-1),
-            KeyCode::Down => app.move_cursor(1),
-            KeyCode::Right => {
-                app.enter_selected();
+        let mut layout = UiLayout::default();
+        terminal.draw(|frame| {
+            layout = ui(frame, app, preview.as_ref(), editor.as_ref());
+        })?;
+
+        let input = event::read()?;
+        if let Some(current) = editor.as_mut() {
+            let action = handle_editor_event(input, app, current, layout)?;
+            if matches!(action, EditorAction::Close) {
+                editor = None;
                 preview = None;
             }
-            KeyCode::Left | KeyCode::Backspace => {
-                app.go_parent();
-                preview = None;
-            }
-            KeyCode::Char(' ') => app.toggle_mark(),
-            KeyCode::Char('/') => app.search_begin(),
-            KeyCode::Char('M' | 'm') => app.create_begin(),
-            KeyCode::Char('S' | 's') => app.cycle_sort(),
-            KeyCode::Char('O' | 'o') => app.toggle_desc(),
-            KeyCode::Char('v') => toggle_preview(terminal, app, &mut preview)?,
-            KeyCode::PageUp => {
-                if let Some(preview) = preview.as_mut() {
-                    preview.scroll_page(-1);
+            continue;
+        }
+
+        match input {
+            Event::Mouse(mouse) => handle_browse_mouse(mouse, app, layout),
+            Event::Key(key) => {
+                // 只响应按下事件：kitty 键盘协议下 Release/Repeat 也会上报
+                if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                // 筛选输入模式：可打印字符进筛选词（q 不再退出），Space 仍标记光标条目，
+                // Esc 清除筛选返回，仅 Ctrl-C 整体退出；→/← 不响应（先 Enter/Esc 回浏览模式）
+                if app.searching {
+                    match key.code {
+                        KeyCode::Esc => app.search_cancel(),
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            return Ok(());
+                        }
+                        KeyCode::Char(' ') => app.toggle_mark(),
+                        KeyCode::Char(c) => app.search_input(c),
+                        KeyCode::Backspace => app.search_del_char(),
+                        KeyCode::Enter => app.search_commit(),
+                        KeyCode::Up => app.move_cursor(-1),
+                        KeyCode::Down => app.move_cursor(1),
+                        _ => {}
+                    }
+                    continue;
+                }
+                // 新建文件夹输入模式：可打印字符（含空格）进名字，Enter 创建，Esc 取消；
+                // q 等可打印字符均为名字字符，仅 Ctrl-C 整体退出
+                if app.creating {
+                    match key.code {
+                        KeyCode::Esc => app.create_cancel(),
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            return Ok(());
+                        }
+                        KeyCode::Char(c) => app.create_input(c),
+                        KeyCode::Backspace => app.create_del_char(),
+                        KeyCode::Enter => mkdir_confirm(app),
+                        _ => {}
+                    }
+                    continue;
+                }
+                match key.code {
+                    KeyCode::Up => app.move_cursor(-1),
+                    KeyCode::Down => app.move_cursor(1),
+                    KeyCode::Right => {
+                        app.enter_selected();
+                        preview = None;
+                    }
+                    KeyCode::Left | KeyCode::Backspace => {
+                        app.go_parent();
+                        preview = None;
+                    }
+                    KeyCode::Char(' ') => app.toggle_mark(),
+                    KeyCode::Char('/') => app.search_begin(),
+                    KeyCode::Char('M' | 'm') => app.create_begin(),
+                    KeyCode::Char('S' | 's') => app.cycle_sort(),
+                    KeyCode::Char('O' | 'o') => app.toggle_desc(),
+                    KeyCode::Char('v') => toggle_preview(terminal, app, &mut preview)?,
+                    KeyCode::Char('e') => {
+                        open_editor(app, &mut editor)?;
+                        if editor.is_some() {
+                            preview = None;
+                        }
+                    }
+                    KeyCode::PageUp => {
+                        if let Some(preview) = preview.as_mut() {
+                            preview.scroll_page(-1);
+                        }
+                    }
+                    KeyCode::PageDown => {
+                        if let Some(preview) = preview.as_mut() {
+                            preview.scroll_page(1);
+                        }
+                    }
+                    KeyCode::Home => {
+                        if let Some(preview) = preview.as_mut() {
+                            preview.scroll_edge(false);
+                        }
+                    }
+                    KeyCode::End => {
+                        if let Some(preview) = preview.as_mut() {
+                            preview.scroll_edge(true);
+                        }
+                    }
+                    KeyCode::Enter => pull_marked(terminal, app, out_dir, &preview)?,
+                    _ if is_quit_key(key.code, key.modifiers) => return Ok(()),
+                    _ => {}
                 }
             }
-            KeyCode::PageDown => {
-                if let Some(preview) = preview.as_mut() {
-                    preview.scroll_page(1);
-                }
-            }
-            KeyCode::Home => {
-                if let Some(preview) = preview.as_mut() {
-                    preview.scroll_edge(false);
-                }
-            }
-            KeyCode::End => {
-                if let Some(preview) = preview.as_mut() {
-                    preview.scroll_edge(true);
-                }
-            }
-            KeyCode::Enter => pull_marked(terminal, app, out_dir, &preview)?,
-            _ if is_quit_key(key.code, key.modifiers) => return Ok(()),
             _ => {}
         }
+    }
+}
+
+/// 编辑器事件处理结果。
+enum EditorAction {
+    /// 编辑器继续保持打开。
+    Stay,
+    /// 用户已保存或确认丢弃修改，可以回到文件列表。
+    Close,
+}
+
+/// 将终端事件交给编辑器；保存和退出等应用级快捷键由本模块处理，
+/// 普通按键与滚轮交给成熟的 `tui-textarea-2` 控件。
+fn handle_editor_event(
+    input: Event,
+    app: &mut App,
+    editor: &mut RemoteEditor,
+    layout: UiLayout,
+) -> Result<EditorAction> {
+    match input {
+        Event::Key(key) if key.kind == KeyEventKind::Press => {
+            Ok(handle_editor_key(app, editor, key))
+        }
+        Event::Mouse(mouse) => {
+            handle_editor_mouse(editor, mouse, layout);
+            Ok(EditorAction::Stay)
+        }
+        _ => Ok(EditorAction::Stay),
+    }
+}
+
+/// 处理编辑器的保存、冲突确认、退出和普通文字输入。
+fn handle_editor_key(
+    app: &mut App,
+    editor: &mut RemoteEditor,
+    key: ratatui::crossterm::event::KeyEvent,
+) -> EditorAction {
+    if let Some(prompt) = editor.prompt {
+        match prompt {
+            EditorPrompt::Unsaved => match key.code {
+                KeyCode::Char('s') => save_editor_with_prompt(app, editor, false),
+                KeyCode::Char('d') => return EditorAction::Close,
+                KeyCode::Esc => editor.prompt = None,
+                _ => {}
+            },
+            EditorPrompt::RemoteChanged => match key.code {
+                KeyCode::Char('o') => save_editor_with_prompt(app, editor, true),
+                KeyCode::Esc => editor.prompt = None,
+                _ => {}
+            },
+        }
+        return EditorAction::Stay;
+    }
+
+    if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+        save_editor_with_prompt(app, editor, false);
+        return EditorAction::Stay;
+    }
+    if key.code == KeyCode::Esc {
+        // 撤销可能把内容恢复成快照；只在离开时做一次序列化，避免每次输入都复制 10 MiB 文本。
+        if editor.dirty && editor.bytes() == editor.original_bytes {
+            editor.dirty = false;
+        }
+        if editor.dirty {
+            editor.prompt = Some(EditorPrompt::Unsaved);
+            return EditorAction::Stay;
+        }
+        return EditorAction::Close;
+    }
+
+    if apply_editor_input(editor, key) {
+        editor.dirty = true;
+    }
+    EditorAction::Stay
+}
+
+/// 在编辑器控件接受按键前限制文本容量。
+///
+/// 普通字符、Tab 和换行可以直接根据当前位置计算上界；删除、粘贴、撤销/重做等
+/// 可能受选区或历史影响的操作则先在克隆控件中执行并校验。这样拒绝的操作不会
+/// 进入真实控件的 undo/redo 历史，也不会在下一帧渲染前留下越界状态。
+fn apply_editor_input(editor: &mut RemoteEditor, key: KeyEvent) -> bool {
+    if let Some(fits) = simple_editor_input_fits(editor, &key) {
+        return fits && editor.textarea.input(key);
+    }
+    if !editor_input_may_modify_text(&key) {
+        return editor.textarea.input(key);
+    }
+
+    let mut candidate = editor.textarea.clone();
+    if !candidate.input(key) || validate_editor_lines(candidate.lines()).is_err() {
+        return false;
+    }
+    editor.textarea = candidate;
+    true
+}
+
+/// 返回普通字符、Tab 或换行是否仍在编辑器容量内；其他按键返回 `None`。
+fn simple_editor_input_fits(editor: &RemoteEditor, key: &KeyEvent) -> Option<bool> {
+    let lines = editor.textarea.lines();
+    let (row, column) = editor.textarea.cursor();
+    let line = lines.get(row)?;
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+
+    match key.code {
+        KeyCode::Enter => Some(lines.len() < MAX_EDITOR_LINES),
+        KeyCode::Char('m') if control && !alt => Some(lines.len() < MAX_EDITOR_LINES),
+        KeyCode::Char('\n' | '\r') if !control && !alt => Some(lines.len() < MAX_EDITOR_LINES),
+        KeyCode::Char(ch) if !control && !alt => {
+            let prefix_width = editor_display_width(line.chars().take(column));
+            let added_width = if ch == '\t' {
+                let tab_length = usize::from(EDITOR_TAB_LENGTH);
+                tab_length - prefix_width % tab_length
+            } else {
+                ch.width().unwrap_or(0)
+            };
+            let width = editor_display_width(line.chars());
+            Some(
+                line.chars().count() < MAX_EDITOR_COLUMNS
+                    && width.saturating_add(added_width) <= MAX_EDITOR_COLUMNS,
+            )
+        }
+        KeyCode::Tab if !control && !alt => {
+            let prefix_width = editor_display_width(line.chars().take(column));
+            let tab_length = usize::from(EDITOR_TAB_LENGTH);
+            let added_width = tab_length - prefix_width % tab_length;
+            let width = editor_display_width(line.chars());
+            Some(
+                line.chars().count().saturating_add(added_width) <= MAX_EDITOR_COLUMNS
+                    && width.saturating_add(added_width) <= MAX_EDITOR_COLUMNS,
+            )
+        }
+        _ => None,
+    }
+}
+
+/// 判断按键是否可能修改文本但不能用当前位置直接计算结果。
+fn editor_input_may_modify_text(key: &KeyEvent) -> bool {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Backspace | KeyCode::Delete => !control,
+        KeyCode::Char('d' | 'h') if control || alt => true,
+        KeyCode::Char('j' | 'k' | 'r' | 'u' | 'w' | 'x' | 'y') if control && !alt => true,
+        _ => false,
+    }
+}
+
+/// 处理编辑器内的鼠标点击与滚轮；坐标命中和 Unicode 宽度换算由 textarea 库完成。
+fn handle_editor_mouse(editor: &mut RemoteEditor, mouse: MouseEvent, layout: UiLayout) {
+    let Some(area) = layout.editor else {
+        return;
+    };
+    let position = Position::new(mouse.column, mouse.row);
+    if !area.contains(position) {
+        return;
+    }
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some((row, column)) = editor.textarea.cursor_at_position(position) {
+                editor.textarea.move_cursor(CursorMove::Jump(
+                    row.min(u16::MAX as usize) as u16,
+                    column.min(u16::MAX as usize) as u16,
+                ));
+            }
+        }
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+            editor.textarea.input(mouse);
+        }
+        _ => {}
+    }
+}
+
+/// 处理浏览模式下列表的单击选中和滚轮移动。
+fn handle_browse_mouse(mouse: MouseEvent, app: &mut App, layout: UiLayout) {
+    let Some(area) = layout.list else {
+        return;
+    };
+    let position = Position::new(mouse.column, mouse.row);
+    if !area.contains(position) {
+        return;
+    }
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            // 列表有一行边框，鼠标首行/末行不对应条目。
+            let first_row = area.y.saturating_add(1);
+            let last_row = area.y.saturating_add(area.height.saturating_sub(1));
+            if position.y < first_row || position.y >= last_row {
+                return;
+            }
+            let row = usize::from(position.y - first_row);
+            let index = app.state.offset().saturating_add(row);
+            if index < app.visible().len() {
+                app.state.select(Some(index));
+            }
+        }
+        MouseEventKind::ScrollUp => app.move_cursor(-3),
+        MouseEventKind::ScrollDown => app.move_cursor(3),
+        _ => {}
+    }
+}
+
+/// 打开当前选中的远端 UTF-8 文本文件。
+///
+/// 目录、特殊文件、图片和含控制字符的二进制文件保持预览/浏览语义，不进入编辑器；
+/// 远端读取失败只写入状态区，继续留在文件列表中。
+fn open_editor(app: &mut App, editor: &mut Option<RemoteEditor>) -> Result<()> {
+    let Some(index) = app.selected_entry_index() else {
+        app.push_status(StatusLine::Err("没有选中的条目，无法编辑".to_owned()));
+        return Ok(());
+    };
+    let Some(entry) = app.entries.get(index) else {
+        return Ok(());
+    };
+    if !matches!(entry.kind, EntryKind::File | EntryKind::Symlink) {
+        app.push_status(StatusLine::Err(
+            "编辑只支持普通文件和文件符号链接".to_owned(),
+        ));
+        return Ok(());
+    }
+    let name = entry.name.clone();
+    let path = join_path(&app.cwd, &name);
+    let bytes = match adb::read_file(app.serial.as_deref(), &path, MAX_FILE_BYTES) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            app.push_status(StatusLine::Err(format!("读取 {path} 失败：{err}")));
+            return Ok(());
+        }
+    };
+    if bytes.len() > MAX_FILE_BYTES {
+        app.push_status(StatusLine::Err(format!(
+            "文件超过 {} MiB 编辑上限",
+            MAX_FILE_BYTES / (1024 * 1024)
+        )));
+        return Ok(());
+    }
+    let Some(content) = decode_plain_text(&bytes) else {
+        app.push_status(StatusLine::Err(
+            "编辑只支持没有控制字符的 UTF-8 纯文本".to_owned(),
+        ));
+        return Ok(());
+    };
+
+    let line_ending = if content.contains("\r\n") {
+        LineEnding::CrLf
+    } else {
+        LineEnding::Lf
+    };
+    let lines = text_lines(&content);
+    if let Err(err) = validate_editor_lines(&lines) {
+        app.push_status(StatusLine::Err(err.to_string()));
+        return Ok(());
+    }
+    let mut textarea = TextArea::new(lines);
+    textarea.set_tab_length(EDITOR_TAB_LENGTH);
+    textarea.set_block(Block::bordered().title(format!(" 编辑 · {name} ")));
+    *editor = Some(RemoteEditor {
+        path,
+        textarea,
+        original_bytes: bytes,
+        line_ending,
+        dirty: false,
+        prompt: None,
+    });
+    Ok(())
+}
+
+/// 将文本拆为 textarea 行，同时保留文件末尾换行并去除 CRLF 中的 CR。
+fn text_lines(content: &str) -> Vec<String> {
+    content
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line).to_owned())
+        .collect()
+}
+
+/// 校验已拆分、去除 CRLF 中 CR 的文本行，防止控件的 u16 坐标溢出。
+///
+/// 超过行数、单行字符数或显示列数上限时返回可直接展示的错误；不修改内容。
+fn validate_editor_lines(lines: &[String]) -> Result<()> {
+    anyhow::ensure!(
+        lines.len() <= MAX_EDITOR_LINES,
+        "文本超过 {MAX_EDITOR_LINES} 行编辑上限（含末尾空行）"
+    );
+    for (row, line) in lines.iter().enumerate() {
+        let character_count = line.chars().count();
+        let width = editor_display_width(line.chars());
+        anyhow::ensure!(
+            character_count <= MAX_EDITOR_COLUMNS && width <= MAX_EDITOR_COLUMNS,
+            "第 {} 行超过 {MAX_EDITOR_COLUMNS} 字符或显示列编辑上限",
+            row + 1
+        );
+    }
+    Ok(())
+}
+
+/// 按编辑器的制表位和 Unicode 宽度规则计算字符显示列数。
+fn editor_display_width(chars: impl Iterator<Item = char>) -> usize {
+    chars.fold(0, |width, ch| {
+        width.saturating_add(if ch == '\t' {
+            let tab_length = usize::from(EDITOR_TAB_LENGTH);
+            tab_length - width % tab_length
+        } else {
+            ch.width().unwrap_or(0)
+        })
+    })
+}
+
+/// 保存结果；远端快照冲突时不触碰写回动作。
+enum SaveResult {
+    /// 已成功写回或本地内容本来就与快照一致。
+    Saved,
+    /// 远端内容与打开时快照不同，需要用户明确确认覆盖。
+    RemoteChanged,
+}
+
+/// 重新读取远端并按快照检测冲突，确认后再覆盖写回。
+fn save_editor(app: &App, editor: &mut RemoteEditor, overwrite: bool) -> Result<SaveResult> {
+    let remote = adb::read_file(app.serial.as_deref(), &editor.path, MAX_FILE_BYTES)?;
+    if !overwrite && remote != editor.original_bytes {
+        return Ok(SaveResult::RemoteChanged);
+    }
+    if !editor.dirty && !overwrite {
+        return Ok(SaveResult::Saved);
+    }
+
+    let bytes = editor.bytes();
+    if bytes.len() > MAX_FILE_BYTES {
+        anyhow::bail!(
+            "编辑内容超过 {} MiB 写入上限",
+            MAX_FILE_BYTES / (1024 * 1024)
+        );
+    }
+    if bytes == editor.original_bytes && !overwrite {
+        editor.dirty = false;
+        return Ok(SaveResult::Saved);
+    }
+
+    adb::write_file(app.serial.as_deref(), &editor.path, &bytes)?;
+    editor.original_bytes = bytes;
+    editor.dirty = false;
+    Ok(SaveResult::Saved)
+}
+
+/// 执行保存并把冲突/错误转成编辑器内可见提示，不关闭编辑器。
+fn save_editor_with_prompt(app: &mut App, editor: &mut RemoteEditor, overwrite: bool) {
+    match save_editor(app, editor, overwrite) {
+        Ok(SaveResult::Saved) => {
+            editor.prompt = None;
+            app.push_status(StatusLine::Ok(format!("已保存 {}", editor.path)));
+        }
+        Ok(SaveResult::RemoteChanged) => {
+            editor.prompt = Some(EditorPrompt::RemoteChanged);
+            app.push_status(StatusLine::Warn(format!(
+                "远端文件 {} 已被修改：按 o 覆盖写回，Esc 取消",
+                editor.path
+            )));
+        }
+        Err(err) => app.push_status(StatusLine::Err(format!("保存 {} 失败：{err}", editor.path))),
     }
 }
 
@@ -269,9 +749,11 @@ fn toggle_preview(
         name: name.clone(),
         path: path.clone(),
     });
-    terminal.draw(|frame| ui(frame, app, preview.as_ref()))?;
+    terminal.draw(|frame| {
+        ui(frame, app, preview.as_ref(), None);
+    })?;
 
-    let loaded = adb::read_file(app.serial.as_deref(), &path, MAX_PREVIEW_BYTES)
+    let loaded = adb::read_file(app.serial.as_deref(), &path, MAX_FILE_BYTES)
         .and_then(|bytes| build_preview(name, path.clone(), bytes));
     match loaded {
         Ok(value) => *preview = Some(value),
@@ -285,8 +767,8 @@ fn toggle_preview(
 
 /// 将设备端文件字节转换为文本或图片预览数据。
 fn build_preview(name: String, path: String, bytes: Vec<u8>) -> Result<Preview> {
-    if bytes.len() > MAX_PREVIEW_BYTES {
-        anyhow::bail!("文件超过 2 MiB 预览上限");
+    if bytes.len() > MAX_FILE_BYTES {
+        anyhow::bail!("文件超过 {} MiB 预览上限", MAX_FILE_BYTES / (1024 * 1024));
     }
     if let Some((image, width, height)) = decode_image(&bytes)? {
         return Ok(Preview::Image(ImagePreview {
@@ -413,13 +895,17 @@ fn pull_marked(
     let total = targets.len();
     // 一次性统计所有目标大小（du，KB 粒度），拉取中据此换算百分比
     app.pulling = Some("正在统计待拉取内容大小…".to_owned());
-    terminal.draw(|frame| ui(frame, app, preview.as_ref()))?;
+    terminal.draw(|frame| {
+        ui(frame, app, preview.as_ref(), None);
+    })?;
     let totals = adb::du_totals(app.serial.as_deref(), &targets);
     let mut cancelled = false;
     for (i, remote) in targets.iter().enumerate() {
         let name = base_name(remote);
         app.pulling = Some(format!("({i}/{total}) {name}"));
-        terminal.draw(|frame| ui(frame, app, preview.as_ref()))?;
+        terminal.draw(|frame| {
+            ui(frame, app, preview.as_ref(), None);
+        })?;
         let local_path = out_dir.join(name);
         // serial 先拷出，避免首参对 app 的不可变借用与闭包里的可变借用冲突
         let serial = app.serial.clone();
@@ -432,7 +918,9 @@ fn pull_marked(
             |pct| {
                 app.pulling = Some(format!("({i}/{total}) {name} · {pct}%"));
                 // 闭包里无法 ?，draw 失败先吞掉，pull 结束后的外层重绘会统一报
-                let _ = terminal.draw(|frame| ui(frame, app, preview.as_ref()));
+                let _ = terminal.draw(|frame| {
+                    ui(frame, app, preview.as_ref(), None);
+                });
             },
         );
         match result {
@@ -499,9 +987,14 @@ fn mkdir_confirm(app: &mut App) {
     }
 }
 
-/// 渲染一帧：无预览时列表占满上方区域；有预览时上方区域左右各半，
-/// 状态区与帮助栏仍横跨终端底部。
-fn ui(frame: &mut Frame, app: &mut App, preview: Option<&Preview>) {
+/// 渲染一帧：编辑模式独占上方区域；否则无预览时列表占满上方区域，
+/// 有预览时左右各半。返回区域供鼠标事件使用。
+fn ui(
+    frame: &mut Frame,
+    app: &mut App,
+    preview: Option<&Preview>,
+    editor: Option<&RemoteEditor>,
+) -> UiLayout {
     let status = status_content(app);
     let status_h: u16 = if status.is_empty() {
         0
@@ -515,18 +1008,45 @@ fn ui(frame: &mut Frame, app: &mut App, preview: Option<&Preview>) {
     ])
     .split(frame.area());
 
-    if let Some(preview) = preview {
+    let layout = if let Some(editor) = editor {
+        render_editor(frame, editor, chunks[0]);
+        UiLayout {
+            editor: Some(chunks[0]),
+            ..UiLayout::default()
+        }
+    } else if let Some(preview) = preview {
         let panes = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
             .split(chunks[0]);
         render_list(frame, app, panes[0]);
         render_preview(frame, preview, panes[1]);
+        UiLayout {
+            list: Some(panes[0]),
+            ..UiLayout::default()
+        }
     } else {
         render_list(frame, app, chunks[0]);
-    }
+        UiLayout {
+            list: Some(chunks[0]),
+            ..UiLayout::default()
+        }
+    };
     if !status.is_empty() {
         render_status(frame, status, chunks[1], app.error.is_some());
     }
-    render_help(frame, chunks[2], help_text(app.creating, app.searching));
+    let help = editor.map_or_else(
+        || help_text(app.creating, app.searching).to_owned(),
+        editor_help_text,
+    );
+    render_help(frame, chunks[2], &help);
+    layout
+}
+
+/// 渲染成熟 textarea 控件，并把其计算出的真实光标位置交给 ratatui。
+fn render_editor(frame: &mut Frame, editor: &RemoteEditor, area: Rect) {
+    frame.render_widget(&editor.textarea, area);
+    if let Some(position) = editor.textarea.rendered_cursor_position() {
+        frame.set_cursor_position(position);
+    }
 }
 
 /// 渲染右侧预览面板：文本使用 Paragraph 滚动，图片使用每个终端单元格上下
@@ -697,7 +1217,23 @@ fn help_text(creating: bool, searching: bool) -> &'static str {
     } else if searching {
         "输入筛选词（大小写不敏感） · ↑↓ 移动 · Enter 保留筛选 · Esc 清除 · Ctrl-C 退出"
     } else {
-        "↑↓ 移动 · → 进入 · ←/⌫ 返回 · v 预览/关闭 · PageUp/Down 滚动 · / 筛选 · S/s 排序 · O/o 方向 · M/m 新建 · Space 标记 · Enter 拉取 · q/Esc 退出（拉取中=取消）"
+        "↑↓ 移动 · 鼠标单击/滚轮 · → 进入 · ←/⌫ 返回 · v 预览/关闭 · e 编辑 · PageUp/Down 滚动 · / 筛选 · S/s 排序 · O/o 方向 · M/m 新建 · Space 标记 · Enter 拉取 · q/Esc 退出（拉取中=取消）"
+    }
+}
+
+/// 编辑器底部帮助栏文案，区分普通编辑和两个确认提示。
+fn editor_help_text(editor: &RemoteEditor) -> String {
+    match editor.prompt {
+        Some(EditorPrompt::Unsaved) => {
+            "存在未保存修改：s 保存 · d 丢弃并退出 · Esc 继续编辑".to_owned()
+        }
+        Some(EditorPrompt::RemoteChanged) => {
+            "远端文件已修改：o 覆盖写回 · Esc 取消保存并继续编辑".to_owned()
+        }
+        None if editor.dirty => {
+            "Ctrl-S 保存 · Esc 退出（有修改） · 鼠标单击定位 · 滚轮滚动 · ↑↓←→ 移动".to_owned()
+        }
+        None => "Ctrl-S 保存 · Esc 退出 · 鼠标单击定位 · 滚轮滚动 · ↑↓←→ 移动".to_owned(),
     }
 }
 
@@ -775,12 +1311,248 @@ mod tests {
         assert!(browse.contains("M/m 新建"));
         assert!(browse.contains("Enter 拉取"));
         assert!(browse.contains("v 预览/关闭"));
+        assert!(browse.contains("e 编辑"));
+        assert!(browse.contains("鼠标单击/滚轮"));
         assert!(browse.contains("PageUp/Down 滚动"));
         // 筛选版
         assert!(help_text(false, true).contains("筛选词"));
         // 新建版优先于筛选（事件循环保证两者互斥，此处为防御性排序）
         assert!(help_text(true, false).contains("新文件夹名"));
         assert!(help_text(true, true).contains("新文件夹名"));
+    }
+
+    #[test]
+    fn text_lines_preserve_trailing_newline_and_normalize_crlf() {
+        assert_eq!(text_lines("第一行\r\n第二行\r\n"), ["第一行", "第二行", ""]);
+        assert_eq!(text_lines("第一行\n第二行"), ["第一行", "第二行"]);
+        assert_eq!(text_lines(""), [""]);
+    }
+
+    #[test]
+    fn editor_serializes_original_line_ending() {
+        let content = "第一行\r\n第二行\r\n";
+        let mut textarea = TextArea::new(text_lines(content));
+        textarea.set_block(Block::bordered().title(" 编辑 "));
+        let editor = RemoteEditor {
+            path: "/sdcard/notes.txt".into(),
+            textarea,
+            original_bytes: content.as_bytes().to_vec(),
+            line_ending: LineEnding::CrLf,
+            dirty: false,
+            prompt: None,
+        };
+        assert_eq!(editor.bytes(), content.as_bytes());
+    }
+
+    #[test]
+    fn editor_rejects_reported_70000_character_line() {
+        let lines = text_lines(&"a".repeat(70_000));
+        assert!(validate_editor_lines(&lines).is_err());
+    }
+
+    #[test]
+    fn editor_rejects_column_without_room_for_caret_boundary() {
+        assert!(validate_editor_lines(&["a".repeat(65_535)]).is_err());
+    }
+
+    #[test]
+    fn editor_rejects_character_after_column_capacity() {
+        let mut textarea = TextArea::new(vec!["a".repeat(MAX_EDITOR_COLUMNS)]);
+        textarea.move_cursor(CursorMove::End);
+        let mut editor = RemoteEditor {
+            path: "/sdcard/notes.txt".into(),
+            textarea,
+            original_bytes: Vec::new(),
+            line_ending: LineEnding::Lf,
+            dirty: false,
+            prompt: None,
+        };
+        let mut app = app_with_entries(vec![]);
+        handle_editor_key(
+            &mut app,
+            &mut editor,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
+        assert_eq!(
+            editor.textarea.lines()[0].chars().count(),
+            MAX_EDITOR_COLUMNS
+        );
+    }
+
+    #[test]
+    fn editor_rejects_tab_character_after_display_capacity() {
+        let mut textarea = TextArea::new(vec!["a".repeat(MAX_EDITOR_COLUMNS - 1)]);
+        textarea.move_cursor(CursorMove::End);
+        let mut editor = RemoteEditor {
+            path: "/sdcard/notes.txt".into(),
+            textarea,
+            original_bytes: Vec::new(),
+            line_ending: LineEnding::Lf,
+            dirty: false,
+            prompt: None,
+        };
+        let mut app = app_with_entries(vec![]);
+        handle_editor_key(
+            &mut app,
+            &mut editor,
+            KeyEvent::new(KeyCode::Char('\t'), KeyModifiers::NONE),
+        );
+        assert_eq!(
+            editor.textarea.lines()[0].chars().count(),
+            MAX_EDITOR_COLUMNS - 1
+        );
+    }
+
+    #[test]
+    fn editor_rejects_newline_after_line_capacity() {
+        let mut textarea = TextArea::new(vec![String::new(); MAX_EDITOR_LINES]);
+        textarea.move_cursor(CursorMove::Bottom);
+        let mut editor = RemoteEditor {
+            path: "/sdcard/notes.txt".into(),
+            textarea,
+            original_bytes: Vec::new(),
+            line_ending: LineEnding::Lf,
+            dirty: false,
+            prompt: None,
+        };
+        let mut app = app_with_entries(vec![]);
+        handle_editor_key(
+            &mut app,
+            &mut editor,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        );
+        assert_eq!(editor.textarea.lines().len(), MAX_EDITOR_LINES);
+    }
+
+    #[test]
+    fn editor_rejects_deletion_that_would_join_oversized_lines() {
+        let first = "a".repeat(MAX_EDITOR_COLUMNS / 2 + 1);
+        let second = "b".repeat(MAX_EDITOR_COLUMNS / 2);
+        let mut textarea = TextArea::new(vec![first.clone(), second.clone()]);
+        textarea.move_cursor(CursorMove::Bottom);
+        textarea.move_cursor(CursorMove::Head);
+        let mut editor = RemoteEditor {
+            path: "/sdcard/notes.txt".into(),
+            textarea,
+            original_bytes: Vec::new(),
+            line_ending: LineEnding::Lf,
+            dirty: false,
+            prompt: None,
+        };
+        let mut app = app_with_entries(vec![]);
+        handle_editor_key(
+            &mut app,
+            &mut editor,
+            KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE),
+        );
+        assert_eq!(editor.textarea.lines(), [first, second]);
+    }
+
+    #[test]
+    fn editor_checks_wide_characters_by_display_columns() {
+        assert!(validate_editor_lines(&["中".repeat(32_768)]).is_err());
+    }
+
+    #[test]
+    fn editor_checks_tabs_by_display_columns() {
+        assert!(validate_editor_lines(&["\t".repeat(16_384)]).is_err());
+    }
+
+    #[test]
+    fn editor_checks_zero_width_characters_by_character_count() {
+        assert!(validate_editor_lines(&["\u{0301}".repeat(65_535)]).is_err());
+    }
+
+    #[test]
+    fn editor_counts_trailing_empty_line_towards_capacity() {
+        assert!(validate_editor_lines(&text_lines(&"\n".repeat(65_535))).is_err());
+    }
+
+    #[test]
+    fn editor_accepts_crlf_and_tab_at_column_boundary() {
+        let content = format!("{}a\t中\r\n", "a".repeat(65_528));
+        assert!(validate_editor_lines(&text_lines(&content)).is_ok());
+    }
+
+    #[test]
+    fn editor_capacity_boundaries_support_rendered_mouse_position() {
+        // 分别覆盖最大行数和最大列宽，避免构造二者乘积大小的文档。
+        for lines in [vec![String::new(); 65_535], vec!["a".repeat(65_534)]] {
+            validate_editor_lines(&lines).unwrap();
+            let mut textarea = TextArea::new(lines);
+            textarea.move_cursor(CursorMove::Bottom);
+            textarea.move_cursor(CursorMove::End);
+            let expected = textarea.cursor();
+            let mut terminal = Terminal::new(TestBackend::new(30, 4)).unwrap();
+            terminal
+                .draw(|frame| frame.render_widget(&textarea, frame.area()))
+                .unwrap();
+            let position = textarea.rendered_cursor_position().unwrap();
+            assert_eq!(textarea.cursor_at_position(position), Some(expected));
+        }
+    }
+
+    #[test]
+    fn list_mouse_click_selects_visible_row() {
+        let mut app = app_with_entries(vec![
+            mk("a.txt", EntryKind::File, 1, 0),
+            mk("b.txt", EntryKind::File, 2, 0),
+            mk("c.txt", EntryKind::File, 3, 0),
+        ]);
+        app.state.select(Some(0));
+        let area = Rect::new(0, 0, 30, 5);
+        handle_browse_mouse(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 4,
+                row: 2,
+                modifiers: KeyModifiers::NONE,
+            },
+            &mut app,
+            UiLayout {
+                list: Some(area),
+                ..UiLayout::default()
+            },
+        );
+        assert_eq!(app.state.selected(), Some(1));
+    }
+
+    #[test]
+    fn editor_mouse_click_uses_unicode_aware_hit_testing() {
+        let content = "你好 world";
+        let mut textarea = TextArea::new(text_lines(content));
+        textarea.set_block(Block::bordered().title(" 编辑 "));
+        let mut editor = RemoteEditor {
+            path: "/sdcard/notes.txt".into(),
+            textarea,
+            original_bytes: content.as_bytes().to_vec(),
+            line_ending: LineEnding::Lf,
+            dirty: false,
+            prompt: None,
+        };
+        let area = Rect::new(0, 0, 30, 4);
+        let mut terminal = Terminal::new(TestBackend::new(30, 4)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(&editor.textarea, area);
+            })
+            .unwrap();
+
+        // 边框内 x=3 位于两个宽字符之后；库返回按字符计数的第 1 列，而非字节偏移。
+        handle_editor_mouse(
+            &mut editor,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 3,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            UiLayout {
+                editor: Some(area),
+                ..UiLayout::default()
+            },
+        );
+        assert_eq!(editor.textarea.cursor(), (0, 1));
     }
 
     #[test]
@@ -887,7 +1659,9 @@ mod tests {
         });
 
         terminal
-            .draw(|frame| ui(frame, &mut app, Some(&preview)))
+            .draw(|frame| {
+                ui(frame, &mut app, Some(&preview), None);
+            })
             .unwrap();
 
         let buffer = terminal.backend().buffer();
@@ -913,12 +1687,12 @@ mod tests {
         let error = match build_preview(
             "large.txt".to_owned(),
             "/sdcard/large.txt".to_owned(),
-            vec![b'x'; MAX_PREVIEW_BYTES + 1],
+            vec![b'x'; MAX_FILE_BYTES + 1],
         ) {
             Ok(_) => panic!("oversized bytes should not create a preview"),
             Err(error) => error,
         };
-        assert!(error.to_string().contains("2 MiB"));
+        assert!(error.to_string().contains("10 MiB"));
     }
 
     #[test]
