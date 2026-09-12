@@ -1,13 +1,15 @@
 //! 事件循环、批量拉取与渲染：`browse` 的 TUI 层。
 //!
 //! adb 调用只发生在批量拉取路径（`du -s` 统计与逐项 pull）与新建文件夹
-//! （`shell mkdir`，经 [`crate::adb`]），状态变更全部走 [`super::app`] 的方法。
+//! （`shell mkdir`，经 [`crate::adb`]）和文件预览；状态变更全部走
+//! [`super::app`] 的方法。
 
 use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Result;
+use image::{RgbImage, imageops};
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Style};
@@ -19,6 +21,85 @@ use super::app::{App, StatusLine};
 use super::model::{Entry, EntryKind, SortKey};
 use super::paths::{base_name, dup_base_names, filter_covered, join_path, validate_dir_name};
 use crate::adb;
+
+/// 单次预览最多读取的字节数；多读取一个字节用于识别超限文件。
+const MAX_PREVIEW_BYTES: usize = 2 * 1024 * 1024;
+
+/// 右侧预览面板的内容状态。
+enum Preview {
+    /// 正在从设备读取文件时显示的占位状态。
+    Loading { name: String, path: String },
+    /// 已解码的纯文本内容和当前垂直滚动位置。
+    Text(TextPreview),
+    /// 已解码的图片内容，绘制时按右侧面板尺寸缩放。
+    Image(ImagePreview),
+}
+
+/// 文本预览的显示数据。
+struct TextPreview {
+    /// 文件名，用于右侧面板标题。
+    name: String,
+    /// 设备端绝对路径，用于判断再次按 `v` 是否关闭当前预览。
+    path: String,
+    /// 已通过 UTF-8 与控制字符检查的文本。
+    content: String,
+    /// 跳过的文本行数。
+    scroll: u16,
+}
+
+/// 图片预览的显示数据。
+struct ImagePreview {
+    /// 文件名，用于右侧面板标题。
+    name: String,
+    /// 设备端绝对路径，用于判断再次按 `v` 是否关闭当前预览。
+    path: String,
+    /// 转换为 RGB 后的图片像素。
+    image: RgbImage,
+    /// 原始图片宽度，用于标题显示。
+    width: u32,
+    /// 原始图片高度，用于标题显示。
+    height: u32,
+}
+
+impl Preview {
+    /// 返回预览对应的设备端路径，供 `v` 更新或关闭预览面板。
+    fn path(&self) -> &str {
+        match self {
+            Self::Loading { path, .. }
+            | Self::Text(TextPreview { path, .. })
+            | Self::Image(ImagePreview { path, .. }) => path,
+        }
+    }
+
+    /// 按页移动文本预览位置；图片和加载状态不需要滚动。
+    fn scroll_page(&mut self, direction: i32) {
+        let Self::Text(text) = self else {
+            return;
+        };
+        const PAGE_LINES: u16 = 10;
+        if direction < 0 {
+            text.scroll = text.scroll.saturating_sub(PAGE_LINES);
+        } else {
+            text.scroll = text.scroll.saturating_add(PAGE_LINES);
+        }
+    }
+
+    /// 把文本预览移动到首行或末行。
+    fn scroll_edge(&mut self, end: bool) {
+        let Self::Text(text) = self else {
+            return;
+        };
+        text.scroll = if end {
+            text.content
+                .lines()
+                .count()
+                .saturating_sub(1)
+                .min(u16::MAX as usize) as u16
+        } else {
+            0
+        };
+    }
+}
 
 /// 是否退出/取消键（q/Esc/Ctrl-C），与底部帮助栏文案保持一致。
 fn is_quit_key(code: KeyCode, modifiers: KeyModifiers) -> bool {
@@ -51,8 +132,9 @@ pub(super) fn event_loop(
     app: &mut App,
     out_dir: &Path,
 ) -> Result<()> {
+    let mut preview = None;
     loop {
-        terminal.draw(|frame| ui(frame, app))?;
+        terminal.draw(|frame| ui(frame, app, preview.as_ref()))?;
         let Event::Key(key) = event::read()? else {
             continue;
         };
@@ -96,18 +178,135 @@ pub(super) fn event_loop(
         match key.code {
             KeyCode::Up => app.move_cursor(-1),
             KeyCode::Down => app.move_cursor(1),
-            KeyCode::Right => app.enter_selected(),
-            KeyCode::Left | KeyCode::Backspace => app.go_parent(),
+            KeyCode::Right => {
+                app.enter_selected();
+                preview = None;
+            }
+            KeyCode::Left | KeyCode::Backspace => {
+                app.go_parent();
+                preview = None;
+            }
             KeyCode::Char(' ') => app.toggle_mark(),
             KeyCode::Char('/') => app.search_begin(),
             KeyCode::Char('M' | 'm') => app.create_begin(),
             KeyCode::Char('S' | 's') => app.cycle_sort(),
             KeyCode::Char('O' | 'o') => app.toggle_desc(),
-            KeyCode::Enter => pull_marked(terminal, app, out_dir)?,
+            KeyCode::Char('v') => toggle_preview(terminal, app, &mut preview)?,
+            KeyCode::PageUp => {
+                if let Some(preview) = preview.as_mut() {
+                    preview.scroll_page(-1);
+                }
+            }
+            KeyCode::PageDown => {
+                if let Some(preview) = preview.as_mut() {
+                    preview.scroll_page(1);
+                }
+            }
+            KeyCode::Home => {
+                if let Some(preview) = preview.as_mut() {
+                    preview.scroll_edge(false);
+                }
+            }
+            KeyCode::End => {
+                if let Some(preview) = preview.as_mut() {
+                    preview.scroll_edge(true);
+                }
+            }
+            KeyCode::Enter => pull_marked(terminal, app, out_dir, &preview)?,
             _ if is_quit_key(key.code, key.modifiers) => return Ok(()),
             _ => {}
         }
     }
+}
+
+/// 按当前选中条目加载、更新或关闭右侧预览面板。
+///
+/// 目录和设备特殊文件不读取；普通文件与符号链接通过 `adb exec-out` 读取，
+/// 成功后按图片格式和纯文本规则选择对应的面板内容。读取失败只进入状态区，
+/// 不会退出浏览器。
+fn toggle_preview(
+    terminal: &mut DefaultTerminal,
+    app: &mut App,
+    preview: &mut Option<Preview>,
+) -> Result<()> {
+    let Some(index) = app.selected_entry_index() else {
+        *preview = None;
+        app.push_status(StatusLine::Err("没有选中的条目，无法预览".to_owned()));
+        return Ok(());
+    };
+    let Some(entry) = app.entries.get(index) else {
+        return Ok(());
+    };
+    if !matches!(entry.kind, EntryKind::File | EntryKind::Symlink) {
+        *preview = None;
+        app.push_status(StatusLine::Err(
+            "预览只支持普通文件和文件符号链接".to_owned(),
+        ));
+        return Ok(());
+    }
+    let name = entry.name.clone();
+    let path = join_path(&app.cwd, &name);
+    if preview
+        .as_ref()
+        .is_some_and(|current| current.path() == path)
+    {
+        *preview = None;
+        return Ok(());
+    }
+
+    *preview = Some(Preview::Loading {
+        name: name.clone(),
+        path: path.clone(),
+    });
+    terminal.draw(|frame| ui(frame, app, preview.as_ref()))?;
+
+    let loaded = adb::read_file(app.serial.as_deref(), &path, MAX_PREVIEW_BYTES)
+        .and_then(|bytes| build_preview(name, path.clone(), bytes));
+    match loaded {
+        Ok(value) => *preview = Some(value),
+        Err(err) => {
+            *preview = None;
+            app.push_status(StatusLine::Err(format!("预览 {path} 失败：{err}")));
+        }
+    }
+    Ok(())
+}
+
+/// 将设备端文件字节转换为文本或图片预览数据。
+fn build_preview(name: String, path: String, bytes: Vec<u8>) -> Result<Preview> {
+    if bytes.len() > MAX_PREVIEW_BYTES {
+        anyhow::bail!("文件超过 2 MiB 预览上限");
+    }
+    if let Ok(image) = image::load_from_memory(&bytes) {
+        return Ok(Preview::Image(ImagePreview {
+            name,
+            path,
+            width: image.width(),
+            height: image.height(),
+            image: image.to_rgb8(),
+        }));
+    }
+    if let Some(content) = decode_plain_text(&bytes) {
+        return Ok(Preview::Text(TextPreview {
+            name,
+            path,
+            content,
+            scroll: 0,
+        }));
+    }
+    anyhow::bail!("只支持纯文本和 PNG/JPEG/GIF/BMP/WebP 图片")
+}
+
+/// 解码没有终端控制字符的 UTF-8 文本，避免原样渲染二进制或 ANSI 转义序列。
+fn decode_plain_text(bytes: &[u8]) -> Option<String> {
+    let content = std::str::from_utf8(bytes).ok()?;
+    if content
+        .chars()
+        .any(|c| c.is_control() && !matches!(c, '\n' | '\r' | '\t'))
+    {
+        return None;
+    }
+    Some(content.to_owned())
 }
 
 /// 拉取全部已标记条目到 out_dir（逐个阻塞 adb pull，进度按本地落盘字节估算）。
@@ -120,7 +319,12 @@ pub(super) fn event_loop(
 /// 每项结束后追加 ✓/✗ 到 status；单项失败不中断整体。
 /// 全部完成后清空标记（标记是"待办清单"语义，取消中止时不清空），
 /// 并丢弃拉取期间积压的按键，防止恢复后光标乱跳。
-fn pull_marked(terminal: &mut DefaultTerminal, app: &mut App, out_dir: &Path) -> Result<()> {
+fn pull_marked(
+    terminal: &mut DefaultTerminal,
+    app: &mut App,
+    out_dir: &Path,
+    preview: &Option<Preview>,
+) -> Result<()> {
     if app.marked.is_empty() {
         app.status = vec![StatusLine::Err(
             "未标记任何条目，先按 Space 标记".to_owned(),
@@ -147,13 +351,13 @@ fn pull_marked(terminal: &mut DefaultTerminal, app: &mut App, out_dir: &Path) ->
     let total = targets.len();
     // 一次性统计所有目标大小（du，KB 粒度），拉取中据此换算百分比
     app.pulling = Some("正在统计待拉取内容大小…".to_owned());
-    terminal.draw(|frame| ui(frame, app))?;
+    terminal.draw(|frame| ui(frame, app, preview.as_ref()))?;
     let totals = adb::du_totals(app.serial.as_deref(), &targets);
     let mut cancelled = false;
     for (i, remote) in targets.iter().enumerate() {
         let name = base_name(remote);
         app.pulling = Some(format!("({i}/{total}) {name}"));
-        terminal.draw(|frame| ui(frame, app))?;
+        terminal.draw(|frame| ui(frame, app, preview.as_ref()))?;
         let local_path = out_dir.join(name);
         // serial 先拷出，避免首参对 app 的不可变借用与闭包里的可变借用冲突
         let serial = app.serial.clone();
@@ -166,7 +370,7 @@ fn pull_marked(terminal: &mut DefaultTerminal, app: &mut App, out_dir: &Path) ->
             |pct| {
                 app.pulling = Some(format!("({i}/{total}) {name} · {pct}%"));
                 // 闭包里无法 ?，draw 失败先吞掉，pull 结束后的外层重绘会统一报
-                let _ = terminal.draw(|frame| ui(frame, app));
+                let _ = terminal.draw(|frame| ui(frame, app, preview.as_ref()));
             },
         );
         match result {
@@ -233,8 +437,9 @@ fn mkdir_confirm(app: &mut App) {
     }
 }
 
-/// 渲染一帧：列表区（自适应）/ 状态区（仅有内容时出现）/ 帮助栏（固定 1 行）。
-fn ui(frame: &mut Frame, app: &mut App) {
+/// 渲染一帧：无预览时列表占满上方区域；有预览时上方区域左右各半，
+/// 状态区与帮助栏仍横跨终端底部。
+fn ui(frame: &mut Frame, app: &mut App, preview: Option<&Preview>) {
     let status = status_content(app);
     let status_h: u16 = if status.is_empty() {
         0
@@ -248,11 +453,81 @@ fn ui(frame: &mut Frame, app: &mut App) {
     ])
     .split(frame.area());
 
-    render_list(frame, app, chunks[0]);
+    if let Some(preview) = preview {
+        let panes = Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(chunks[0]);
+        render_list(frame, app, panes[0]);
+        render_preview(frame, preview, panes[1]);
+    } else {
+        render_list(frame, app, chunks[0]);
+    }
     if !status.is_empty() {
         render_status(frame, status, chunks[1], app.error.is_some());
     }
     render_help(frame, chunks[2], help_text(app.creating, app.searching));
+}
+
+/// 渲染右侧预览面板：文本使用 Paragraph 滚动，图片使用每个终端单元格上下
+/// 两种颜色的半块字符，加载中显示状态文字。
+fn render_preview(frame: &mut Frame, preview: &Preview, area: Rect) {
+    match preview {
+        Preview::Loading { name, path } => {
+            frame.render_widget(
+                Paragraph::new(format!("读取 {path}…"))
+                    .style(Style::new().fg(Color::DarkGray))
+                    .block(Block::bordered().title(format!(" 预览 · {name} "))),
+                area,
+            );
+        }
+        Preview::Text(text) => {
+            let title = format!(" 预览 · 文本 · {} ", text.name);
+            frame.render_widget(
+                Paragraph::new(text.content.as_str())
+                    .scroll((text.scroll, 0))
+                    .block(Block::bordered().title(title)),
+                area,
+            );
+        }
+        Preview::Image(image) => render_image_preview(frame, image, area),
+    }
+}
+
+/// 在指定区域内按终端字符比例缩放图片并绘制。
+fn render_image_preview(frame: &mut Frame, preview: &ImagePreview, area: Rect) {
+    let block = Block::bordered().title(format!(
+        " 预览 · 图片 · {} ({}×{}) ",
+        preview.name, preview.width, preview.height
+    ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // 一个终端单元格用上半块字符承载上下两个像素，补偿字符通常高于宽的比例。
+    let target_width = u32::from(inner.width);
+    let target_height = u32::from(inner.height).saturating_mul(2);
+    let thumbnail = imageops::thumbnail(&preview.image, target_width, target_height);
+    let image_width = thumbnail.width() as u16;
+    let image_height = thumbnail.height().div_ceil(2) as u16;
+    let start_x = inner.x + inner.width.saturating_sub(image_width) / 2;
+    let start_y = inner.y + inner.height.saturating_sub(image_height) / 2;
+    let buffer = frame.buffer_mut();
+
+    for y in 0..image_height {
+        for x in 0..image_width {
+            let top = thumbnail.get_pixel(u32::from(x), u32::from(y) * 2);
+            let top_color = Color::Rgb(top[0], top[1], top[2]);
+            let cell = &mut buffer[(start_x + x, start_y + y)];
+            cell.set_symbol("▀").set_fg(top_color);
+            if u32::from(y) * 2 + 1 < thumbnail.height() {
+                let bottom = thumbnail.get_pixel(u32::from(x), u32::from(y) * 2 + 1);
+                cell.set_bg(Color::Rgb(bottom[0], bottom[1], bottom[2]));
+            } else {
+                cell.set_bg(Color::Reset);
+            }
+        }
+    }
 }
 
 /// 汇总状态区内容：错误横幅、逐条状态行（按 [`StatusLine`] 变体定前缀/颜色）、
@@ -360,7 +635,7 @@ fn help_text(creating: bool, searching: bool) -> &'static str {
     } else if searching {
         "输入筛选词（大小写不敏感） · ↑↓ 移动 · Enter 保留筛选 · Esc 清除 · Ctrl-C 退出"
     } else {
-        "↑↓ 移动 · → 进入 · ←/⌫ 返回 · / 筛选 · S/s 排序 · O/o 方向 · M/m 新建 · Space 标记 · Enter 拉取 · q/Esc 退出（拉取中=取消）"
+        "↑↓ 移动 · → 进入 · ←/⌫ 返回 · v 预览/关闭 · PageUp/Down 滚动 · / 筛选 · S/s 排序 · O/o 方向 · M/m 新建 · Space 标记 · Enter 拉取 · q/Esc 退出（拉取中=取消）"
     }
 }
 
@@ -419,6 +694,7 @@ mod tests {
     use super::super::app::app_with_entries;
     use super::super::model::mk;
     use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
 
     #[test]
     fn quit_keys_match_help_text() {
@@ -436,6 +712,8 @@ mod tests {
         let browse = help_text(false, false);
         assert!(browse.contains("M/m 新建"));
         assert!(browse.contains("Enter 拉取"));
+        assert!(browse.contains("v 预览/关闭"));
+        assert!(browse.contains("PageUp/Down 滚动"));
         // 筛选版
         assert!(help_text(false, true).contains("筛选词"));
         // 新建版优先于筛选（事件循环保证两者互斥，此处为防御性排序）
@@ -476,6 +754,90 @@ mod tests {
         assert_eq!(human_size(1536), "1.5 KB");
         assert_eq!(human_size(1048576), "1.0 MB");
         assert_eq!(human_size(1_500_000_000), "1.4 GB");
+    }
+
+    #[test]
+    fn decodes_plain_text_preview() {
+        let preview = build_preview(
+            "notes.txt".to_owned(),
+            "/sdcard/notes.txt".to_owned(),
+            "第一行\n第二行".as_bytes().to_vec(),
+        )
+        .unwrap();
+        let Preview::Text(text) = preview else {
+            panic!("UTF-8 text should create a text preview");
+        };
+        assert_eq!(text.name, "notes.txt");
+        assert_eq!(text.content, "第一行\n第二行");
+        assert_eq!(text.scroll, 0);
+    }
+
+    #[test]
+    fn decodes_png_preview() {
+        // 1×1 PNG，验证图片按内容识别而不是依赖文件名后缀。
+        const ONE_PIXEL_PNG: &[u8] = &[
+            137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1,
+            8, 4, 0, 0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 100, 248, 15,
+            0, 1, 5, 1, 1, 39, 24, 227, 102, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+        ];
+        let preview = build_preview(
+            "photo.bin".to_owned(),
+            "/sdcard/photo.bin".to_owned(),
+            ONE_PIXEL_PNG.to_vec(),
+        )
+        .unwrap();
+        let Preview::Image(image) = preview else {
+            panic!("PNG bytes should create an image preview");
+        };
+        assert_eq!((image.width, image.height), (1, 1));
+    }
+
+    #[test]
+    fn renders_image_inside_right_preview_pane() {
+        let backend = TestBackend::new(40, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = app_with_entries(vec![mk("photo.png", EntryKind::File, 4, 0)]);
+        let preview = Preview::Image(ImagePreview {
+            name: "photo.png".to_owned(),
+            path: "/sdcard/photo.png".to_owned(),
+            image: RgbImage::from_pixel(2, 2, image::Rgb([255, 0, 0])),
+            width: 2,
+            height: 2,
+        });
+
+        terminal
+            .draw(|frame| ui(frame, &mut app, Some(&preview)))
+            .unwrap();
+
+        let buffer = terminal.backend().buffer();
+        assert!(buffer.content().iter().any(|cell| cell.symbol() == "▀"));
+        assert!(buffer.content().iter().any(|cell| cell.symbol() == "预"));
+    }
+
+    #[test]
+    fn rejects_binary_preview() {
+        let error = match build_preview(
+            "data.bin".to_owned(),
+            "/sdcard/data.bin".to_owned(),
+            vec![0, 159, 146, 150],
+        ) {
+            Ok(_) => panic!("binary bytes should not create a preview"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("只支持纯文本"));
+    }
+
+    #[test]
+    fn rejects_preview_over_size_limit() {
+        let error = match build_preview(
+            "large.txt".to_owned(),
+            "/sdcard/large.txt".to_owned(),
+            vec![b'x'; MAX_PREVIEW_BYTES + 1],
+        ) {
+            Ok(_) => panic!("oversized bytes should not create a preview"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("2 MiB"));
     }
 
     #[test]

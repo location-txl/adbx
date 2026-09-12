@@ -51,6 +51,15 @@ fn adb_command(serial: Option<&str>) -> Command {
 }
 
 fn run_adb_raw(serial: Option<&str>, args: &[&str]) -> Result<(String, String)> {
+    let (stdout, stderr) = run_adb_raw_bytes(serial, args)?;
+    Ok((
+        String::from_utf8_lossy(&stdout).into_owned(),
+        String::from_utf8_lossy(&stderr).into_owned(),
+    ))
+}
+
+/// 执行 adb 并保留 stdout/stderr 原始字节，供文件预览等二进制场景使用。
+fn run_adb_raw_bytes(serial: Option<&str>, args: &[&str]) -> Result<(Vec<u8>, Vec<u8>)> {
     let output = adb_command(serial)
         .args(args)
         .output()
@@ -62,10 +71,7 @@ fn run_adb_raw(serial: Option<&str>, args: &[&str]) -> Result<(String, String)> 
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
-    Ok((
-        String::from_utf8_lossy(&output.stdout).into_owned(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
-    ))
+    Ok((output.stdout, output.stderr))
 }
 
 /// 原样透传执行 adb：以 adb 子进程替换本进程，成功时本函数不返回。
@@ -252,6 +258,34 @@ pub fn shell_mkdir(serial: Option<&str>, path: &str) -> Result<()> {
     Ok(())
 }
 
+/// 读取设备端文件的前 `max_bytes + 1` 个字节（`adb exec-out`，保留二进制内容）。
+///
+/// * `path` - 设备端文件路径；通过设备端 shell 单引号转义，含空格和特殊字符安全
+/// * `max_bytes` - 调用方允许预览的最大字节数；多读一个字节用于判断文件是否超限
+///
+/// 返回的字节可直接交给文本解码器或图片解码器。文件不存在、目标是目录、设备断开
+/// 或 adb 不可用时返回 Err；文件超过上限时由调用方根据返回长度决定是否拒绝展示。
+pub fn read_file(serial: Option<&str>, path: &str, max_bytes: usize) -> Result<Vec<u8>> {
+    let read_limit = max_bytes.saturating_add(1);
+    let command = read_file_command(path, max_bytes);
+    let args = ["exec-out", "sh", "-c", command.as_str()];
+    let (mut stdout, _) = run_adb_raw_bytes(serial, &args)?;
+    // dd 按固定块读取，最后一个块可能略大于限制；在本地截断，避免额外依赖设备端命令。
+    stdout.truncate(read_limit);
+    Ok(stdout)
+}
+
+/// 生成 Android 常见 `dd` 语法的读取命令；按块读取避免 `head -c` 在旧版 toybox 上不兼容。
+/// `exec-out` 是原始字节流，必须丢弃 dd 的统计输出，避免污染预览内容。
+fn read_file_command(path: &str, max_bytes: usize) -> String {
+    const BLOCK_SIZE: usize = 4096;
+    let blocks = max_bytes.saturating_add(1).div_ceil(BLOCK_SIZE);
+    format!(
+        "dd if={} bs={BLOCK_SIZE} count={blocks} 2>/dev/null",
+        shell_quote(path)
+    )
+}
+
 /// 解析 `du -s` 多路径输出（纯函数，可单测）。
 ///
 /// toybox 行格式 `KB数\t路径`（路径与入参一致，可含中文/空格）；按路径回填到
@@ -408,7 +442,7 @@ fn tree_size(path: &Path) -> u64 {
 mod tests {
     use super::{
         du_totals, is_uninstall_success, parse_adb_version, parse_du_lines, pull_with_progress,
-        shell_quote, tree_size,
+        read_file_command, shell_quote, tree_size,
     };
 
     #[test]
@@ -429,6 +463,15 @@ mod tests {
     fn shell_quote_escapes_inner_single_quotes() {
         // 内部单引号：闭合引号 + 转义单引号 + 重新开引号，拼回 it's
         assert_eq!(shell_quote("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn read_file_uses_dd_for_android_compatibility() {
+        let command = read_file_command("/sdcard/My Files/notes.txt", 2 * 1024 * 1024);
+        assert_eq!(
+            command,
+            "dd if='/sdcard/My Files/notes.txt' bs=4096 count=513 2>/dev/null"
+        );
     }
 
     #[test]

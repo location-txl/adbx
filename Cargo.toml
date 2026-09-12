@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1"
+# 预览常见图片格式，并在终端内缩放为彩色半块字符
+image = { version = "0.24.9", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
 # 保留默认 features：裁剪 color/suggestions 对体积无收益（LTO 已消除），却会丢失帮助彩色输出与拼写建议
 clap = { version = "4", features = ["derive"] }
 # TUI 框架；crossterm 经 ratatui::crossterm re-export 使用。
