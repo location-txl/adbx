@@ -20,7 +20,7 @@ use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 use tui_textarea::{CursorMove, TextArea};
 use unicode_width::UnicodeWidthChar;
@@ -164,12 +164,23 @@ struct RemoteEditor {
 }
 
 /// 编辑器需要用户确认的状态。
-#[derive(Clone, Copy)]
 enum EditorPrompt {
     /// 按 Esc 离开时仍有本地修改。
     Unsaved,
     /// 保存前发现远端内容已变化。
-    RemoteChanged,
+    RemoteChanged {
+        /// 覆盖成功后是否返回文件列表。
+        close_after_save: bool,
+    },
+    /// 写回失败时保留重试参数，并在弹窗内显示错误。
+    SaveFailed {
+        /// 重试是否沿用用户已确认的覆盖操作。
+        overwrite: bool,
+        /// 重试成功后是否返回文件列表。
+        close_after_save: bool,
+        /// 本次保存的错误详情。
+        message: String,
+    },
 }
 
 impl RemoteEditor {
@@ -250,10 +261,24 @@ pub(super) fn event_loop(
 
         let input = event::read()?;
         if let Some(current) = editor.as_mut() {
-            let action = handle_editor_event(input, app, current, layout)?;
-            if matches!(action, EditorAction::Close) {
-                editor = None;
-                preview = None;
+            match handle_editor_event(input, app, current, layout)? {
+                EditorAction::Stay => {}
+                EditorAction::Close => {
+                    editor = None;
+                    preview = None;
+                }
+                EditorAction::RefreshAndClose => {
+                    // 保存可能改变文件大小和修改时间，关闭编辑器前重新加载列表，避免排序和展示继续使用旧元数据。
+                    let saved_path = current.path.clone();
+                    let entry_name = base_name(&saved_path).to_owned();
+                    if !app.reload(&entry_name) {
+                        app.push_status(StatusLine::Warn(format!(
+                            "已保存 {saved_path}，但刷新当前目录失败"
+                        )));
+                    }
+                    editor = None;
+                    preview = None;
+                }
             }
             continue;
         }
@@ -357,6 +382,8 @@ enum EditorAction {
     Stay,
     /// 用户已保存或确认丢弃修改，可以回到文件列表。
     Close,
+    /// 保存成功后刷新当前目录元数据，再回到文件列表。
+    RefreshAndClose,
 }
 
 /// 将终端事件交给编辑器；保存和退出等应用级快捷键由本模块处理，
@@ -385,16 +412,31 @@ fn handle_editor_key(
     editor: &mut RemoteEditor,
     key: ratatui::crossterm::event::KeyEvent,
 ) -> EditorAction {
-    if let Some(prompt) = editor.prompt {
+    if let Some(prompt) = &editor.prompt {
         match prompt {
             EditorPrompt::Unsaved => match key.code {
-                KeyCode::Char('s') => save_editor_with_prompt(app, editor, false),
+                KeyCode::Char('s') => return save_editor_with_prompt(app, editor, false, true),
                 KeyCode::Char('d') => return EditorAction::Close,
                 KeyCode::Esc => editor.prompt = None,
                 _ => {}
             },
-            EditorPrompt::RemoteChanged => match key.code {
-                KeyCode::Char('o') => save_editor_with_prompt(app, editor, true),
+            EditorPrompt::RemoteChanged { close_after_save } => match key.code {
+                KeyCode::Char('o') => {
+                    let close_after_save = *close_after_save;
+                    return save_editor_with_prompt(app, editor, true, close_after_save);
+                }
+                KeyCode::Esc => editor.prompt = None,
+                _ => {}
+            },
+            EditorPrompt::SaveFailed {
+                overwrite,
+                close_after_save,
+                ..
+            } => match key.code {
+                KeyCode::Char('s') => {
+                    let (overwrite, close_after_save) = (*overwrite, *close_after_save);
+                    return save_editor_with_prompt(app, editor, overwrite, close_after_save);
+                }
                 KeyCode::Esc => editor.prompt = None,
                 _ => {}
             },
@@ -403,8 +445,7 @@ fn handle_editor_key(
     }
 
     if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
-        save_editor_with_prompt(app, editor, false);
-        return EditorAction::Stay;
+        return save_editor_with_prompt(app, editor, false, false);
     }
     if key.code == KeyCode::Esc {
         // 撤销可能把内容恢复成快照；只在离开时做一次序列化，避免每次输入都复制 10 MiB 文本。
@@ -499,6 +540,10 @@ fn editor_input_may_modify_text(key: &KeyEvent) -> bool {
 
 /// 处理编辑器内的鼠标点击与滚轮；坐标命中和 Unicode 宽度换算由 textarea 库完成。
 fn handle_editor_mouse(editor: &mut RemoteEditor, mouse: MouseEvent, layout: UiLayout) {
+    // 确认弹窗独占输入，防止点击或滚动影响后面的文本。
+    if editor.prompt.is_some() {
+        return;
+    }
     let Some(area) = layout.editor else {
         return;
     };
@@ -692,22 +737,52 @@ fn save_editor(app: &App, editor: &mut RemoteEditor, overwrite: bool) -> Result<
     Ok(SaveResult::Saved)
 }
 
-/// 执行保存并把冲突/错误转成编辑器内可见提示，不关闭编辑器。
-fn save_editor_with_prompt(app: &mut App, editor: &mut RemoteEditor, overwrite: bool) {
-    match save_editor(app, editor, overwrite) {
+/// 执行设备写回；`overwrite` 表示用户已确认覆盖，`close_after_save` 表示成功后退出。
+/// 冲突或失败始终保留编辑器，由返回的动作决定事件循环是否关闭它。
+fn save_editor_with_prompt(
+    app: &mut App,
+    editor: &mut RemoteEditor,
+    overwrite: bool,
+    close_after_save: bool,
+) -> EditorAction {
+    let result = save_editor(app, editor, overwrite);
+    finish_editor_save(app, editor, result, overwrite, close_after_save)
+}
+
+/// 将保存结果转成弹窗与退出动作；独立于设备 I/O，便于验证失败时不丢失退出意图。
+fn finish_editor_save(
+    app: &mut App,
+    editor: &mut RemoteEditor,
+    result: Result<SaveResult>,
+    overwrite: bool,
+    close_after_save: bool,
+) -> EditorAction {
+    match result {
         Ok(SaveResult::Saved) => {
             editor.prompt = None;
             app.push_status(StatusLine::Ok(format!("已保存 {}", editor.path)));
+            if close_after_save {
+                return EditorAction::RefreshAndClose;
+            }
         }
         Ok(SaveResult::RemoteChanged) => {
-            editor.prompt = Some(EditorPrompt::RemoteChanged);
+            editor.prompt = Some(EditorPrompt::RemoteChanged { close_after_save });
             app.push_status(StatusLine::Warn(format!(
                 "远端文件 {} 已被修改：按 o 覆盖写回，Esc 取消",
                 editor.path
             )));
         }
-        Err(err) => app.push_status(StatusLine::Err(format!("保存 {} 失败：{err}", editor.path))),
+        Err(err) => {
+            let message = format!("保存 {} 失败：{err}", editor.path);
+            app.push_status(StatusLine::Err(message.clone()));
+            editor.prompt = Some(EditorPrompt::SaveFailed {
+                overwrite,
+                close_after_save,
+                message,
+            });
+        }
     }
+    EditorAction::Stay
 }
 
 /// 按当前选中条目加载、更新或关闭右侧预览面板。
@@ -1038,15 +1113,76 @@ fn ui(
         editor_help_text,
     );
     render_help(frame, chunks[2], &help);
+    // 最后绘制，确保状态栏与编辑器都不会遮住确认提示。
+    if let Some(prompt) = editor.and_then(|editor| editor.prompt.as_ref()) {
+        render_editor_prompt(frame, prompt);
+    }
     layout
 }
 
 /// 渲染成熟 textarea 控件，并把其计算出的真实光标位置交给 ratatui。
 fn render_editor(frame: &mut Frame, editor: &RemoteEditor, area: Rect) {
     frame.render_widget(&editor.textarea, area);
-    if let Some(position) = editor.textarea.rendered_cursor_position() {
+    if editor.prompt.is_none()
+        && let Some(position) = editor.textarea.rendered_cursor_position()
+    {
         frame.set_cursor_position(position);
     }
+}
+
+/// 在终端中央覆盖绘制编辑确认，窄终端自动换行，极小终端裁剪到可用区域。
+fn render_editor_prompt(frame: &mut Frame, prompt: &EditorPrompt) {
+    let (title, message, actions) = match prompt {
+        EditorPrompt::Unsaved => (
+            " 未保存修改 ",
+            "文件有未保存的修改，请选择操作。",
+            "s 保存并退出\nd 丢弃并退出\nEsc 继续编辑",
+        ),
+        EditorPrompt::RemoteChanged { close_after_save } => (
+            " 远端文件已修改 ",
+            "远端内容已变化，是否覆盖写回？",
+            if *close_after_save {
+                "o 覆盖并退出\nEsc 继续编辑"
+            } else {
+                "o 覆盖保存\nEsc 继续编辑"
+            },
+        ),
+        EditorPrompt::SaveFailed {
+            message,
+            close_after_save,
+            ..
+        } => (
+            " 保存失败 ",
+            message.as_str(),
+            if *close_after_save {
+                "s 重试保存并退出\nEsc 继续编辑"
+            } else {
+                "s 重试保存\nEsc 继续编辑"
+            },
+        ),
+    };
+    let screen = frame.area();
+    let width = screen.width.min(64);
+    let height = screen.height.min(12);
+    let area = Rect::new(
+        screen.x + (screen.width - width) / 2,
+        screen.y + (screen.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, area);
+    // Reset 使用终端主题的默认前景/背景；ANSI White/Black 不保证实际是白色/黑色。
+    let style = Style::new().fg(Color::Reset).bg(Color::Reset);
+    let block = Block::bordered().title(title).style(style);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    // 操作固定在上方，长错误文本不能把重试与取消键挤出弹窗。
+    frame.render_widget(
+        Paragraph::new(format!("{actions}\n\n{message}"))
+            .style(style)
+            .wrap(Wrap { trim: false }),
+        inner,
+    );
 }
 
 /// 渲染右侧预览面板：文本使用 Paragraph 滚动，图片使用每个终端单元格上下
@@ -1221,15 +1357,10 @@ fn help_text(creating: bool, searching: bool) -> &'static str {
     }
 }
 
-/// 编辑器底部帮助栏文案，区分普通编辑和两个确认提示。
+/// 编辑器底部帮助栏文案；确认期间引导用户查看弹窗。
 fn editor_help_text(editor: &RemoteEditor) -> String {
     match editor.prompt {
-        Some(EditorPrompt::Unsaved) => {
-            "存在未保存修改：s 保存 · d 丢弃并退出 · Esc 继续编辑".to_owned()
-        }
-        Some(EditorPrompt::RemoteChanged) => {
-            "远端文件已修改：o 覆盖写回 · Esc 取消保存并继续编辑".to_owned()
-        }
+        Some(_) => "请在弹窗中选择操作 · Esc 继续编辑".to_owned(),
         None if editor.dirty => {
             "Ctrl-S 保存 · Esc 退出（有修改） · 鼠标单击定位 · 滚轮滚动 · ↑↓←→ 移动".to_owned()
         }
@@ -1293,6 +1424,203 @@ mod tests {
     use super::super::model::mk;
     use super::*;
     use ratatui::{Terminal, backend::TestBackend};
+
+    fn test_editor() -> RemoteEditor {
+        RemoteEditor {
+            path: "/sdcard/notes.txt".into(),
+            textarea: TextArea::new(text_lines("original")),
+            original_bytes: b"original".to_vec(),
+            line_ending: LineEnding::Lf,
+            dirty: false,
+            prompt: None,
+        }
+    }
+
+    #[test]
+    fn editor_escape_confirms_changes_and_cancel_preserves_text() {
+        let mut app = app_with_entries(vec![]);
+        let mut editor = test_editor();
+        let key = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        assert!(matches!(
+            handle_editor_key(&mut app, &mut editor, key(KeyCode::Esc)),
+            EditorAction::Close
+        ));
+        handle_editor_key(&mut app, &mut editor, key(KeyCode::Char('x')));
+        let changed = editor.bytes();
+        assert!(matches!(
+            handle_editor_key(&mut app, &mut editor, key(KeyCode::Esc)),
+            EditorAction::Stay
+        ));
+        assert!(matches!(editor.prompt, Some(EditorPrompt::Unsaved)));
+        handle_editor_key(&mut app, &mut editor, key(KeyCode::Char('z')));
+        assert_eq!(editor.bytes(), changed);
+        handle_editor_key(&mut app, &mut editor, key(KeyCode::Esc));
+        assert!(editor.prompt.is_none());
+        assert_eq!(editor.bytes(), changed);
+        handle_editor_key(&mut app, &mut editor, key(KeyCode::Esc));
+        assert!(matches!(
+            handle_editor_key(&mut app, &mut editor, key(KeyCode::Char('d'))),
+            EditorAction::Close
+        ));
+    }
+
+    #[test]
+    fn editor_escape_after_undo_exits_without_prompt() {
+        let mut app = app_with_entries(vec![]);
+        let mut editor = test_editor();
+        handle_editor_key(
+            &mut app,
+            &mut editor,
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE),
+        );
+        editor.textarea.undo();
+        assert!(matches!(
+            handle_editor_key(
+                &mut app,
+                &mut editor,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+            ),
+            EditorAction::Close
+        ));
+        assert!(!editor.dirty);
+        assert!(editor.prompt.is_none());
+    }
+
+    #[test]
+    fn editor_save_results_preserve_exit_intent_through_conflict_and_failure() {
+        for close_after_save in [false, true] {
+            let mut app = app_with_entries(vec![]);
+            let mut editor = test_editor();
+            editor.textarea.insert_str("changed");
+            editor.dirty = true;
+            let changed = editor.bytes();
+            assert!(matches!(
+                finish_editor_save(
+                    &mut app,
+                    &mut editor,
+                    Ok(SaveResult::RemoteChanged),
+                    false,
+                    close_after_save
+                ),
+                EditorAction::Stay
+            ));
+            assert!(
+                matches!(editor.prompt, Some(EditorPrompt::RemoteChanged { close_after_save: intent }) if intent == close_after_save)
+            );
+            assert!(matches!(
+                finish_editor_save(
+                    &mut app,
+                    &mut editor,
+                    Err(anyhow::anyhow!("device offline")),
+                    true,
+                    close_after_save
+                ),
+                EditorAction::Stay
+            ));
+            assert!(
+                matches!(&editor.prompt, Some(EditorPrompt::SaveFailed { overwrite: true, close_after_save: intent, message }) if *intent == close_after_save && message.contains("device offline"))
+            );
+            assert_eq!(editor.bytes(), changed);
+            assert!(editor.dirty);
+            let action = finish_editor_save(
+                &mut app,
+                &mut editor,
+                Ok(SaveResult::Saved),
+                true,
+                close_after_save,
+            );
+            assert_eq!(
+                matches!(action, EditorAction::RefreshAndClose),
+                close_after_save
+            );
+            assert!(editor.prompt.is_none());
+        }
+    }
+
+    #[test]
+    fn editor_prompt_blocks_mouse_and_hides_cursor() {
+        let mut app = app_with_entries(vec![]);
+        let mut editor = test_editor();
+        editor.prompt = Some(EditorPrompt::Unsaved);
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        let mut layout = UiLayout::default();
+        terminal
+            .draw(|frame| layout = ui(frame, &mut app, None, Some(&editor)))
+            .unwrap();
+        assert!(!terminal.backend().cursor_visible());
+        let before = editor.textarea.cursor();
+        handle_editor_event(
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 5,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+            &mut app,
+            &mut editor,
+            layout,
+        )
+        .unwrap();
+        assert_eq!(editor.textarea.cursor(), before);
+    }
+
+    #[test]
+    fn editor_popups_render_above_content_and_fit_small_terminals() {
+        for (prompt, expected) in [
+            (EditorPrompt::Unsaved, "s 保存并退出"),
+            (
+                EditorPrompt::RemoteChanged {
+                    close_after_save: true,
+                },
+                "o 覆盖并退出",
+            ),
+            (
+                EditorPrompt::SaveFailed {
+                    overwrite: false,
+                    close_after_save: true,
+                    message: "device offline".into(),
+                },
+                "device offline",
+            ),
+        ] {
+            for (width, height) in [(80, 24), (30, 12), (10, 4), (1, 1)] {
+                let mut app = app_with_entries(vec![]);
+                let mut editor = test_editor();
+                // 先验证满屏背景不会残留在弹窗空白区域。
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal
+                    .draw(|frame| {
+                        frame.render_widget(
+                            Paragraph::new("X".repeat(2000)).wrap(Wrap { trim: false }),
+                            frame.area(),
+                        );
+                        render_editor_prompt(frame, &prompt);
+                    })
+                    .unwrap();
+                if width == 80 {
+                    let buffer = terminal.backend().buffer();
+                    assert_eq!(buffer[(9, 16)].symbol(), " ");
+                    // 正文、边框和空白都应使用终端默认配色，避免 ANSI 调色板造成低对比度。
+                    for position in [(9, 7), (8, 6), (9, 16)] {
+                        assert_eq!(buffer[position].fg, Color::Reset);
+                        assert_eq!(buffer[position].bg, Color::Reset);
+                    }
+                    let text: String = buffer.content.iter().map(|cell| cell.symbol()).collect();
+                    // 中文占两列，缓冲区第二列为空格；比较时忽略这些占位。
+                    let compact: String = text.chars().filter(|c| !c.is_whitespace()).collect();
+                    let expected: String =
+                        expected.chars().filter(|c| !c.is_whitespace()).collect();
+                    assert!(compact.contains(&expected), "{text}");
+                }
+                editor.prompt = Some(EditorPrompt::Unsaved);
+                terminal
+                    .draw(|frame| {
+                        ui(frame, &mut app, None, Some(&editor));
+                    })
+                    .unwrap();
+            }
+        }
+    }
 
     #[test]
     fn quit_keys_match_help_text() {
