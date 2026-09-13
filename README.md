@@ -31,6 +31,35 @@ cp target/release/adbx /usr/local/bin/
 
 构建后可用 `adbx doctor` 自检 adb 环境。
 
+### 从 GitHub Release 下载
+
+推送 `v*` 版本 Tag 后，GitHub Actions 会自动创建 [Release](https://github.com/location-txl/adbx/releases)，提供以下平台的压缩包：
+
+| 平台 | 文件 |
+|---|---|
+| Windows x64 | `adbx-v<版本>-x86_64-pc-windows-msvc.zip` |
+| Linux x64 | `adbx-v<版本>-x86_64-unknown-linux-gnu.tar.gz` |
+| macOS Intel | `adbx-v<版本>-x86_64-apple-darwin.tar.gz` |
+| macOS Apple Silicon | `adbx-v<版本>-aarch64-apple-darwin.tar.gz` |
+
+Unix 平台解压后，将 `adbx` 放入 PATH；Windows 平台解压后，将 `adbx.exe` 所在目录加入 PATH。运行 `adbx doctor` 可检查 adb 环境。
+
+#### 一键安装
+
+macOS/Linux：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/location-txl/adbx/main/install.sh | sh
+```
+
+Windows PowerShell：
+
+```powershell
+irm https://raw.githubusercontent.com/location-txl/adbx/main/install.ps1 | iex
+```
+
+安装脚本会自动识别当前平台和架构，默认安装到 `~/.local/bin`（macOS/Linux）或 `%LOCALAPPDATA%\adbx\bin`（Windows）。需要固定版本时，Shell 使用 `--version v0.1.0`，PowerShell 使用 `-Version v0.1.0`；也可以分别通过 `--install-dir` 和 `-InstallDir` 指定安装目录。
+
 ## 使用
 
 ```

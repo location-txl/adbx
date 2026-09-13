@@ -1,0 +1,211 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Install stable Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+  build:
+    name: Build ${{ matrix.name }}
+    needs: verify
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            os: windows-2025
+            target: x86_64-pc-windows-msvc
+            binary: adbx.exe
+          - name: Linux x64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            binary: adbx
+          - name: macOS Intel
+            os: macos-15-intel
+            target: x86_64-apple-darwin
+            binary: adbx
+          - name: macOS Apple Silicon
+            os: macos-15
+            target: aarch64-apple-darwin
+            binary: adbx
+
+    steps:
+      - name: Checkout tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+
+      - name: Install stable Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install target
+        run: rustup target add "${{ matrix.target }}"
+
+      - name: Align package version with tag
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $tag = $env:RELEASE_TAG
+          if (-not $tag.StartsWith("v") -or $tag.Length -le 1) {
+            throw "版本 Tag 必须以 v 开头：$tag"
+          }
+
+          $version = $tag.Substring(1)
+          $semverPattern = '^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$'
+          if ($version -notmatch $semverPattern) {
+            throw "Tag 不是有效的 Cargo 版本：$tag"
+          }
+
+          # Cargo.lock 中的根包版本也必须同步，否则 --locked 会拒绝临时版本。
+          $cargoTomlPattern = '(?ms)(^\[package\]\s+.*?^version\s*=\s*")[^"]+(")'
+          $cargoToml = Get-Content -Raw -Path Cargo.toml
+          if ([regex]::Matches($cargoToml, $cargoTomlPattern).Count -ne 1) {
+            throw "无法唯一定位 Cargo.toml 的 package.version"
+          }
+          $cargoToml = [regex]::Replace(
+            $cargoToml,
+            $cargoTomlPattern,
+            ('${1}' + $version + '${2}'),
+            1
+          )
+          Set-Content -Path Cargo.toml -Value $cargoToml -NoNewline -Encoding utf8
+
+          $cargoLockPattern = '(?ms)(^\[\[package\]\]\s+^name\s*=\s*"adbx"\s+^version\s*=\s*")[^"]+(")'
+          $cargoLock = Get-Content -Raw -Path Cargo.lock
+          if ([regex]::Matches($cargoLock, $cargoLockPattern).Count -ne 1) {
+            throw "无法唯一定位 Cargo.lock 的 adbx 根包版本"
+          }
+          $cargoLock = [regex]::Replace(
+            $cargoLock,
+            $cargoLockPattern,
+            ('${1}' + $version + '${2}'),
+            1
+          )
+          Set-Content -Path Cargo.lock -Value $cargoLock -NoNewline -Encoding utf8
+
+          $metadataJson = cargo metadata --no-deps --locked --format-version 1 | Out-String
+          if ($LASTEXITCODE -ne 0) {
+            throw "cargo metadata 执行失败"
+          }
+          $metadata = $metadataJson | ConvertFrom-Json
+          $actualVersion = ($metadata.packages | Where-Object { $_.name -eq "adbx" }).version
+          if ($actualVersion -ne $version) {
+            throw "Cargo package version 不匹配：期望 $version，实际 $actualVersion"
+          }
+
+      - name: Build release binary
+        run: cargo build --locked --release --target "${{ matrix.target }}"
+
+      - name: Package Windows binary
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          $archive = "dist/adbx-${{ github.ref_name }}-${{ matrix.target }}.zip"
+          Compress-Archive `
+            -Path "target/${{ matrix.target }}/release/${{ matrix.binary }}" `
+            -DestinationPath $archive `
+            -Force
+
+      - name: Package Unix binary
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          tar -czf "dist/adbx-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" \
+            -C "target/${{ matrix.target }}/release" \
+            "${{ matrix.binary }}"
+
+      - name: Upload packaged binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download packaged binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+
+      - name: Check release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          asset_count="$(find dist -maxdepth 1 -type f | wc -l | tr -d ' ')"
+          if [[ "$asset_count" != "4" ]]; then
+            echo "期望 4 个发布资产，实际得到 $asset_count 个："
+            find dist -maxdepth 1 -type f -print
+            exit 1
+          fi
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          # 先去掉构建元数据，避免将元数据中的连字符误判为预发布标识。
+          version="${RELEASE_TAG%%+*}"
+          prerelease=false
+          if [[ "$version" == *-* ]]; then
+            prerelease=true
+          fi
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release edit "$RELEASE_TAG" --prerelease="$prerelease"
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* \
+              --verify-tag \
+              --title "$RELEASE_TAG" \
+              --prerelease="$prerelease" \
+              --generate-notes
+          fi
