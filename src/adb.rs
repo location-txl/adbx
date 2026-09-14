@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -119,9 +119,47 @@ fn parse_adb_version(output: &str) -> Option<String> {
 /// 与设备无关，不使用 serial。adb 不存在时返回 Err（提示安装）；
 /// 版本行格式异常时退回首行原文，不视为错误。
 pub fn adb_version() -> Result<String> {
-    let out = run_adb(None, &["version"])?;
-    Ok(parse_adb_version(&out)
-        .unwrap_or_else(|| out.lines().next().unwrap_or_default().trim().to_owned()))
+    adb_version_at(Path::new("adb"))
+}
+
+/// 查找当前 PATH 中的 adb 文件。
+///
+/// 返回第一个文件路径；调用方仍需执行 `adb version` 验证它确实可运行。
+/// 只检查主机环境，不访问 Android 设备。
+pub(crate) fn find_adb_on_path() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let executable = if cfg!(windows) { "adb.exe" } else { "adb" };
+    std::env::split_paths(&path)
+        .map(|directory| directory.join(executable))
+        .find(|candidate| candidate.is_file())
+}
+
+/// 在指定路径执行 `adb version` 并解析版本号。
+///
+/// * `path` - 主机上的 adb 可执行文件路径，可以是 PATH 中的命令名或绝对路径
+///
+/// 返回 adb 首行版本号；进程无法启动或返回非零退出码时返回 Err。
+pub(crate) fn adb_version_at(path: &Path) -> Result<String> {
+    let output = Command::new(path)
+        .arg("version")
+        .output()
+        .with_context(|| {
+            if path == Path::new("adb") {
+                "无法启动 adb，请确认已安装并在 PATH 中".to_owned()
+            } else {
+                format!("无法启动 adb：{}", path.display())
+            }
+        })?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "adb version 失败：{}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_adb_version(&stdout)
+        .unwrap_or_else(|| stdout.lines().next().unwrap_or_default().trim().to_owned()))
 }
 
 /// 获取设备上已安装的全部包名。

@@ -118,7 +118,15 @@ mod tests {
         classify(&os, |tok| {
             matches!(
                 tok,
-                "stop" | "clear" | "restart" | "uninstall" | "info" | "browse" | "doctor" | "help"
+                "stop"
+                    | "clear"
+                    | "restart"
+                    | "uninstall"
+                    | "info"
+                    | "browse"
+                    | "doctor"
+                    | "adb-install"
+                    | "help"
             )
         })
     }
@@ -147,6 +155,11 @@ mod tests {
     #[test]
     fn known_subcommand_routes_to_own() {
         assert_eq!(route(&["stop", "wechat"]), Route::Own);
+    }
+
+    #[test]
+    fn adb_install_routes_to_own() {
+        assert_eq!(route(&["adb-install"]), Route::Own);
     }
 
     #[test]

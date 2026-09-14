@@ -24,7 +24,13 @@ adbx stop wanandroid
 
 ## 安装
 
-使用前需要先安装 adb，并把它加入 PATH。Android 官方说明见 [SDK Platform-Tools](https://developer.android.com/tools/releases/platform-tools)。
+使用前需要先准备 adb，并把它加入 PATH。已有 adb 时可以直接使用；没有 adb 时，先安装 adbx，再运行 `adbx adb-install` 自动下载并配置官方 Platform-Tools。Android 官方说明见 [SDK Platform-Tools](https://developer.android.com/tools/releases/platform-tools)。
+
+~~~bash
+adbx adb-install
+~~~
+
+下载过程中会显示已下载大小和百分比。命令会把 Platform-Tools 安装到用户目录并写入用户级 PATH；完成后重新打开终端，或按命令输出加载 shell 配置。支持 Bash、zsh 和 fish 的常见启动配置；Windows 会通知环境变更，但已有终端宿主或 IDE 需要完全退出后再打开。
 
 ### macOS 或 Linux
 
@@ -99,13 +105,14 @@ adbx [-s <serial>] <命令> [参数]
 | `info <关键词>...` | 查看包名和版本信息 |
 | `browse [路径] [-o <目录>]` | 浏览设备文件并批量拉取 |
 | `doctor` | 检查 adb 是否可用 |
+| `adb-install` | adb 缺失时自动安装官方 Platform-Tools |
 | 其他 adb 命令 | 原样转发给 adb，例如 `shell`、`devices`、`logcat`、`install` |
 
 各命令的完整参数和示例：
 
 - [使用文档首页](docs/README.md)
 - [stop](docs/stop.md) · [restart](docs/restart.md) · [clear](docs/clear.md)
-- [uninstall](docs/uninstall.md) · [info](docs/info.md) · [doctor](docs/doctor.md)
+- [uninstall](docs/uninstall.md) · [info](docs/info.md) · [doctor](docs/doctor.md) · [adb-install](docs/adb-install.md)
 - [browse](docs/browse.md) · [adb 透传](docs/passthrough.md)
 
 ## 包名关键词

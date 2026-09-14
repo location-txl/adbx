@@ -24,7 +24,7 @@ adb 未安装或不在 PATH 中时：
 ✗ 无法启动 adb，请确认已安装并在 PATH 中
 ~~~
 
-修复 PATH 后重新打开终端，再运行一次 doctor。设备连接问题请使用 adb devices 检查。
+没有 adb 时可以运行 `adbx adb-install` 自动下载官方 Platform-Tools。修复 PATH 后重新打开终端，再运行一次 doctor。设备连接问题请使用 adb devices 检查。
 
 ## 相关说明
 

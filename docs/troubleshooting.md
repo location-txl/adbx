@@ -10,6 +10,8 @@ which adb      # macOS / Linux
 where adb      # Windows
 ~~~
 
+也可以运行 `adbx adb-install` 自动下载并安装官方 Platform-Tools。安装完成后重新打开终端，或按命令输出加载 shell 配置；Windows 下请完全退出并重新打开终端宿主或 IDE。
+
 安装脚本完成后，如果终端仍找不到 adbx，重新打开终端，或把脚本提示的安装目录加入 PATH。
 
 ## 没有设备或设备未授权

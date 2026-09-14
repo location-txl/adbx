@@ -28,10 +28,12 @@ main.rs
 
 1. 在 src/main.rs 的 Command enum 中定义 clap 参数和帮助文字。
 2. 在 src/commands/mod.rs 注册模块。
-3. 在 src/commands/<name>.rs 提供命令入口并调用 src/adb.rs。
+3. 在 src/commands/<name>.rs 提供命令入口；设备命令调用 src/adb.rs，主机环境命令只处理本机 I/O。
 4. 在 docs/ 增加面向使用者的说明；若实现机制有变化，再更新本目录。
 
 根参数 -s/--serial 是全局参数。doctor 不使用 serial；透传命令在路由阶段捕获 serial，并统一转换为 adb 可识别的 -s <serial>。
+
+adb-install 是主机环境命令，不访问设备。它在 PATH 和 adbx 用户目录中检查 adb，缺失时下载并校验官方 Platform-Tools，再按 Bash、zsh 或 fish 的实际启动规则写入用户级 PATH；Windows 写入注册表后广播 `WM_SETTINGCHANGE/Environment`。下载进度通过分块读取实时输出。
 
 ## adb 调用边界
 

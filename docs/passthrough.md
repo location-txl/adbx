@@ -37,7 +37,7 @@ adbx shell --serial x
 
 ## 路由规则
 
-- 已知的 adbx 命令（stop、clear、restart、uninstall、info、browse、doctor，以及 help）由 adbx 处理。
+- 已知的 adbx 命令（stop、clear、restart、uninstall、info、browse、doctor、adb-install，以及 help）由 adbx 处理。
 - -s、--serial、--help、--version 等 adbx 自身参数由 adbx 处理。
 - 其他第一个有效参数按 adb 调用透传，例如 shell、devices、-d。
 - 空参数、只有 -s 或 -s 缺少值时，由 adbx 显示参数错误。

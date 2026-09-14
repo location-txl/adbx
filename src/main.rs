@@ -74,6 +74,9 @@ enum Command {
     },
     /// 检查 adb 是否已安装并显示版本
     Doctor,
+    /// adb 缺失时下载并安装官方 Android SDK Platform-Tools
+    #[command(name = "adb-install")]
+    AdbInstall,
 }
 
 fn main() {
@@ -114,5 +117,7 @@ fn run() -> Result<()> {
         }
         // doctor 检查的是 adb 本身而非设备，serial 无意义，忽略
         Command::Doctor => commands::doctor::run(),
+        // adb-install 只修改本机 adb 环境，serial 无意义，忽略
+        Command::AdbInstall => commands::adb_install::run(),
     }
 }
