@@ -509,7 +509,7 @@ fn ensure_user_path(directory: &Path) -> Result<()> {
     };
     let value_type = current_value
         .as_ref()
-        .map(|value| value.vtype)
+        .map(|value| value.vtype.clone())
         .filter(|value| *value == REG_SZ || *value == REG_EXPAND_SZ)
         .unwrap_or(REG_EXPAND_SZ);
     let bytes: Vec<u8> = new_path
