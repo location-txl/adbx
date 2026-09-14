@@ -181,7 +181,10 @@ switch ($architecture.ToUpperInvariant()) {
     'ARM64' {
         $target = 'aarch64-pc-windows-msvc'
     }
-    'AMD64', 'X64' {
+    'AMD64' {
+        $target = 'x86_64-pc-windows-msvc'
+    }
+    'X64' {
         $target = 'x86_64-pc-windows-msvc'
     }
     default {
