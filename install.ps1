@@ -159,21 +159,33 @@ if ([string]::IsNullOrWhiteSpace($InstallDir)) {
 }
 $InstallDir = [IO.Path]::GetFullPath($InstallDir)
 
-# Prefer the WOW64 variable so 32-bit PowerShell can detect a 64-bit Windows host.
-$architecture = $env:PROCESSOR_ARCHITEW6432
-if ([string]::IsNullOrWhiteSpace($architecture)) {
-    $architecture = $env:PROCESSOR_ARCHITECTURE
+# Detect the OS architecture instead of the current PowerShell process:
+# Windows on ARM runs x64/x86 processes under emulation, where
+# PROCESSOR_ARCHITECTURE reports AMD64/x86. .NET's OSArchitecture reflects
+# the real OS; fall back to the WOW64 variable for old .NET Framework builds.
+$architecture = $null
+try {
+    $architecture = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+}
+catch {
+    $architecture = $env:PROCESSOR_ARCHITEW6432
+    if ([string]::IsNullOrWhiteSpace($architecture)) {
+        $architecture = $env:PROCESSOR_ARCHITECTURE
+    }
 }
 if ([string]::IsNullOrWhiteSpace($architecture)) {
     throw 'Unable to detect the CPU architecture'
 }
 
 switch ($architecture.ToUpperInvariant()) {
-    'AMD64' {
+    'ARM64' {
+        $target = 'aarch64-pc-windows-msvc'
+    }
+    'AMD64', 'X64' {
         $target = 'x86_64-pc-windows-msvc'
     }
     default {
-        throw "Unsupported Windows architecture: $architecture; the current Release only provides Windows x64"
+        throw "Unsupported Windows architecture: $architecture; the current Release provides Windows x64 and ARM64"
     }
 }
 

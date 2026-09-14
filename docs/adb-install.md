@@ -26,7 +26,7 @@ adbx adb-install
 
 - Linux x64：`platform-tools-latest-linux.zip`
 - macOS Intel/Apple Silicon：`platform-tools-latest-darwin.zip`
-- Windows x64：`platform-tools-latest-windows.zip`
+- Windows x64/ARM64：`platform-tools-latest-windows.zip`（Google 未发布 ARM64 版，ARM64 上由 Windows 11 系统模拟层运行 x64 adb）
 
 下载时会显示进度。交互终端使用单行刷新；输出被重定向或运行在 CI 中时，每隔一段大小输出一行。服务端没有提供总大小时，会持续显示已下载大小。
 

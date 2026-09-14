@@ -25,13 +25,14 @@ cargo build --release
 1. 在 Ubuntu 上运行 cargo test --locked 和 cargo clippy --all-targets --locked -- -D warnings。
 2. 按矩阵安装目标 toolchain，校验 Tag 与 Cargo.toml、Cargo.lock 的版本一致。
 3. 为每个平台构建 release 二进制并打包。
-4. 检查得到四个资产后创建或更新 GitHub Release。
+4. 检查得到五个资产后创建或更新 GitHub Release。
 
 当前构建矩阵：
 
 | 平台 | Rust target | 资产格式 |
 | --- | --- | --- |
 | Windows x64 | x86_64-pc-windows-msvc | zip |
+| Windows ARM64 | aarch64-pc-windows-msvc | zip |
 | Linux x64 | x86_64-unknown-linux-gnu | tar.gz |
 | macOS Intel | x86_64-apple-darwin | tar.gz |
 | macOS Apple Silicon | aarch64-apple-darwin | tar.gz |

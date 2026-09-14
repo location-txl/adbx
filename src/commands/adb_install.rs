@@ -64,6 +64,11 @@ pub fn run() -> Result<()> {
     }
 
     let url = platform_tools_url()?;
+    // Windows ARM64 无官方 Platform-Tools，下载的是 x64 版，靠系统模拟层运行。
+    #[cfg(all(target_os = "windows", target_arch = "aarch64"))]
+    println!(
+        "提示：Google 未提供 Windows ARM64 版 Platform-Tools，将安装 x64 版 adb，由 Windows 11 on ARM 系统模拟层运行"
+    );
     let parent = tools_dir
         .parent()
         .context("无法确定 adb 安装目录的父目录")?;
@@ -134,7 +139,13 @@ fn platform_tools_url() -> Result<&'static str> {
 }
 
 /// 根据当前编译目标选择 Google 官方 Platform-Tools 下载地址。
-#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+///
+/// Google 未发布 Windows ARM64 版 Platform-Tools；Windows 11 on ARM 的
+/// 系统模拟层可直接运行压缩包中的 x64 adb，因此 ARM64 复用 x64 地址。
+#[cfg(all(
+    target_os = "windows",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 fn platform_tools_url() -> Result<&'static str> {
     Ok("https://dl.google.com/android/repository/platform-tools-latest-windows.zip")
 }
@@ -144,7 +155,10 @@ fn platform_tools_url() -> Result<&'static str> {
     all(target_os = "linux", target_arch = "x86_64"),
     all(target_os = "macos", target_arch = "x86_64"),
     all(target_os = "macos", target_arch = "aarch64"),
-    all(target_os = "windows", target_arch = "x86_64")
+    all(
+        target_os = "windows",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )
 )))]
 fn platform_tools_url() -> Result<&'static str> {
     anyhow::bail!(
@@ -318,10 +332,8 @@ fn extract_archive(archive_path: &Path, destination: &Path) -> Result<()> {
         let mut entry = archive
             .by_index(index)
             .with_context(|| format!("无法读取 Platform-Tools 压缩包条目 {index}"))?;
-        if entry
-            .unix_mode()
-            .is_some_and(|mode| mode & 0o170000 == 0o120000)
-        {
+        let unix_mode = entry.unix_mode();
+        if unix_mode.is_some_and(|mode| mode & 0o170000 == 0o120000) {
             anyhow::bail!(
                 "Platform-Tools 压缩包包含不支持的符号链接：{}",
                 entry.name()
@@ -347,6 +359,9 @@ fn extract_archive(archive_path: &Path, destination: &Path) -> Result<()> {
             .with_context(|| format!("无法创建解压文件：{}", output_path.display()))?;
         io::copy(&mut entry, &mut output_file)
             .with_context(|| format!("无法写入解压文件：{}", output_path.display()))?;
+
+        #[cfg(unix)]
+        restore_unix_permissions(&output_path, unix_mode)?;
     }
     Ok(())
 }
@@ -369,7 +384,7 @@ fn safe_archive_entry_path(name: &str) -> Result<PathBuf> {
 }
 
 #[cfg(unix)]
-/// 为解压出的 adb 补充可执行权限，避免 ZIP 权限信息在解压过程中丢失。
+/// 在权限元数据缺失时为 adb 补充可执行权限。
 fn set_executable(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -377,6 +392,22 @@ fn set_executable(path: &Path) -> Result<()> {
     permissions.set_mode(permissions.mode() | 0o111);
     fs::set_permissions(path, permissions)
         .with_context(|| format!("无法设置 adb 可执行权限：{}", path.display()))
+}
+
+#[cfg(unix)]
+/// 恢复普通文件的 Unix 权限位，并过滤可能带来提权风险的特殊权限位。
+fn restore_unix_permissions(path: &Path, unix_mode: Option<u32>) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some(unix_mode) = unix_mode else {
+        return Ok(());
+    };
+    let mut permissions = fs::metadata(path)
+        .with_context(|| format!("无法读取解压文件权限：{}", path.display()))?
+        .permissions();
+    permissions.set_mode(unix_mode & 0o777);
+    fs::set_permissions(path, permissions)
+        .with_context(|| format!("无法恢复解压文件权限：{}", path.display()))
 }
 
 /// 确保 Platform-Tools 目录存在于当前用户的 PATH 中。
@@ -735,8 +766,8 @@ mod tests {
 
     #[cfg(unix)]
     use super::{
-        PATH_MARKER, has_valid_shell_path_entry, shell_kind, shell_path_line, shell_single_quote,
-        shell_startup_files_for,
+        PATH_MARKER, has_valid_shell_path_entry, restore_unix_permissions, shell_kind,
+        shell_path_line, shell_single_quote, shell_startup_files_for,
     };
 
     #[test]
@@ -774,6 +805,23 @@ mod tests {
             safe_archive_entry_path("platform-tools/adb").unwrap(),
             std::path::PathBuf::from("platform-tools/adb")
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restores_archive_execution_bits_without_special_permissions() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("fastboot");
+        fs::write(&file, b"binary").unwrap();
+
+        restore_unix_permissions(&file, Some(0o100755 | 0o6000)).unwrap();
+
+        let mode = fs::metadata(file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o7000, 0, "setuid/setgid/sticky 位应被过滤");
+        assert_eq!(mode & 0o777, 0o755);
     }
 
     #[cfg(unix)]

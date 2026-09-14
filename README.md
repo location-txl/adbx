@@ -50,7 +50,7 @@ irm https://raw.githubusercontent.com/location-txl/adbx/main/install.ps1 | iex
 
 ### 下载 Release
 
-也可以从 [GitHub Releases](https://github.com/location-txl/adbx/releases) 下载压缩包。当前提供 Windows x64、Linux x64、macOS Intel 和 macOS Apple Silicon 版本。解压后把可执行文件所在目录加入 PATH。
+也可以从 [GitHub Releases](https://github.com/location-txl/adbx/releases) 下载压缩包。当前提供 Windows x64/ARM64、Linux x64、macOS Intel 和 macOS Apple Silicon 版本。解压后把可执行文件所在目录加入 PATH。
 
 ### 从源码构建
 
