@@ -87,7 +87,8 @@ fn main() {
         Route::Own => run(),
     };
     if let Err(err) = result {
-        eprintln!("✗ {err}");
+        // {err:#} 以 ": " 连接整个错误链，让底层 io::Error（如 os error 5/32）可见
+        eprintln!("✗ {err:#}");
         std::process::exit(1);
     }
 }

@@ -7,6 +7,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -17,6 +18,13 @@ use crate::adb;
 const DOWNLOAD_CHUNK_SIZE: usize = 64 * 1024;
 const NON_INTERACTIVE_REPORT_BYTES: u64 = 1024 * 1024;
 const INTERACTIVE_REPORT_INTERVAL_MS: u64 = 100;
+/// Windows ERROR_ACCESS_DENIED，目录内有文件被其他进程持有时目录改名会返回该码。
+const WINDOWS_ERROR_ACCESS_DENIED: i32 = 5;
+/// Windows ERROR_SHARE_VIOLATION，目录内有文件被其他进程以不兼容方式打开。
+const WINDOWS_ERROR_SHARE_VIOLATION: i32 = 32;
+/// 安装目录改名失败后的重试退避间隔（毫秒），总等待约 3 秒，
+/// 足够杀软结束扫描、进程句柄释放。
+const RENAME_RETRY_BACKOFF_MS: [u64; 4] = [200, 400, 800, 1600];
 #[cfg(unix)]
 const PATH_MARKER: &str = "# adbx managed platform-tools";
 
@@ -105,8 +113,12 @@ pub fn run() -> Result<()> {
             tools_dir.display()
         );
     }
-    fs::rename(&extracted_tools_dir, &tools_dir)
-        .with_context(|| format!("无法将 Platform-Tools 安装到 {}", tools_dir.display()))?;
+    rename_with_retry(&extracted_tools_dir, &tools_dir).with_context(|| {
+        format!(
+            "无法将 Platform-Tools 安装到 {}（文件可能被杀毒软件或正在运行的 adb 短暂占用）",
+            tools_dir.display()
+        )
+    })?;
 
     if let Err(err) = ensure_user_path(&tools_dir) {
         anyhow::bail!(
@@ -193,6 +205,38 @@ fn managed_tools_dir() -> Result<PathBuf> {
             .join("adbx")
             .join("platform-tools"))
     }
+}
+
+/// 重命名安装目录，在 Windows 上对瞬时文件锁做退避重试。
+///
+/// Windows 改名目录时，树内任何文件被其他进程持有句柄（杀软扫描刚解压的
+/// exe、子进程退出后镜像句柄延迟释放），整个改名立即失败；这类锁通常在
+/// 数秒内释放，按 [`RENAME_RETRY_BACKOFF_MS`] 退避重试即可等到释放。
+/// 非 Windows 平台等价于单次 `fs::rename`，行为不变。
+///
+/// * `source` - 源目录，成功后不再存在
+/// * `destination` - 目标路径，调用前必须不存在
+///
+/// 返回最后一次 io 错误；重试耗尽仍失败时由调用方的 context 附带说明。
+fn rename_with_retry(source: &Path, destination: &Path) -> io::Result<()> {
+    for backoff_ms in RENAME_RETRY_BACKOFF_MS {
+        match fs::rename(source, destination) {
+            Ok(()) => return Ok(()),
+            Err(err) if cfg!(windows) && is_windows_lock_error(&err) => {
+                thread::sleep(Duration::from_millis(backoff_ms));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    fs::rename(source, destination)
+}
+
+/// 判断是否为 Windows 瞬时文件锁错误（os error 5 拒绝访问 / 32 共享冲突）。
+fn is_windows_lock_error(err: &io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(WINDOWS_ERROR_ACCESS_DENIED) | Some(WINDOWS_ERROR_SHARE_VIOLATION)
+    )
 }
 
 /// 从官方 ZIP 下载文件，并按终端类型显示下载进度。
@@ -762,7 +806,10 @@ fn decode_registry_string(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{format_bytes, format_progress_line, path_contains_entry, safe_archive_entry_path};
+    use super::{
+        format_bytes, format_progress_line, is_windows_lock_error, path_contains_entry,
+        safe_archive_entry_path,
+    };
 
     #[cfg(unix)]
     use super::{
@@ -805,6 +852,19 @@ mod tests {
             safe_archive_entry_path("platform-tools/adb").unwrap(),
             std::path::PathBuf::from("platform-tools/adb")
         );
+    }
+
+    #[test]
+    fn recognizes_windows_transient_lock_error_codes() {
+        let os_error = |code: i32| std::io::Error::from_raw_os_error(code);
+        assert!(is_windows_lock_error(&os_error(5)));
+        assert!(is_windows_lock_error(&os_error(32)));
+        // 其他错误码（如 13 权限不足、2 文件不存在）不属于瞬时锁，不应触发重试
+        assert!(!is_windows_lock_error(&os_error(13)));
+        assert!(!is_windows_lock_error(&os_error(2)));
+        assert!(!is_windows_lock_error(&std::io::Error::other(
+            "无 os 错误码"
+        )));
     }
 
     #[cfg(unix)]
