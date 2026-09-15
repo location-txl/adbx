@@ -240,12 +240,40 @@ fn is_windows_lock_error(err: &io::Error) -> bool {
 }
 
 /// 从官方 ZIP 下载文件，并按终端类型显示下载进度。
+///
+/// 支持 HTTP 代理：读取环境变量 HTTPS_PROXY/https_proxy/ALL_PROXY/all_proxy
+/// （第一个非空者生效，仅支持 CONNECT 方式的 HTTP 代理，不支持 SOCKS）。
 fn download(url: &str, destination: &Path) -> Result<()> {
     println!("正在下载 Android SDK Platform-Tools...");
-    let response = ureq::get(url)
-        .set("User-Agent", concat!("adbx/", env!("CARGO_PKG_VERSION")))
+    // 显式管理代理优先级，避免客户端再次读取环境变量而覆盖空值处理。
+    let mut builder = ureq::AgentBuilder::new()
+        .try_proxy_from_env(false)
+        .timeout_connect(Duration::from_secs(30))
+        .timeout_read(Duration::from_secs(60))
+        .timeout_write(Duration::from_secs(60))
+        .user_agent(concat!("adbx/", env!("CARGO_PKG_VERSION")));
+    // ureq 的 native-tls feature 只提供适配器，需要显式配置系统 TLS。
+    #[cfg(not(target_os = "linux"))]
+    {
+        let connector = ureq::native_tls::TlsConnector::new().context("无法初始化系统 TLS")?;
+        builder = builder.tls_connector(std::sync::Arc::new(connector));
+    }
+    if let Some(spec) = proxy_spec_from_env()? {
+        let proxy = ureq::Proxy::new(spec).context("代理配置无效，应为 host:port 格式")?;
+        builder = builder.proxy(proxy);
+    }
+    let response = builder
+        .build()
+        .get(url)
         .call()
         .with_context(|| format!("无法下载 Platform-Tools：{url}"))?;
+    if !(200..300).contains(&response.status()) {
+        anyhow::bail!(
+            "下载 Platform-Tools 失败：HTTP {} {}",
+            response.status(),
+            response.status_text()
+        );
+    }
     let total = response
         .header("Content-Length")
         .and_then(|value| value.parse::<u64>().ok())
@@ -302,6 +330,45 @@ fn download(url: &str, destination: &Path) -> Result<()> {
         println!();
     }
     Ok(())
+}
+
+/// 净化代理环境变量值为 HTTP 客户端可用的代理地址。
+///
+/// - 空白值视为未设置，返回 `Ok(None)`
+/// - 裸 `host:port`、`user:pass@host:port` 原样通过
+/// - `http://` 前缀剥掉后通过（CONNECT 代理的常规写法）
+/// - 其他 scheme（`socks5://`、`https://` 等）返回 Err：仅启用 HTTP 代理，
+///   静默忽略会让请求绕过代理直连，报错比挂起更可诊断
+fn normalize_proxy_spec(raw: &str) -> Result<Option<String>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if let Some(rest) = trimmed.strip_prefix("http://") {
+        return Ok(Some(rest.to_owned()));
+    }
+    if trimmed.contains("://") {
+        // 原始值可能带用户名和密码，错误中不回显代理地址。
+        return Err("不支持的代理协议（仅支持 HTTP 代理）".to_owned());
+    }
+    Ok(Some(trimmed.to_owned()))
+}
+
+/// 按优先级读取代理环境变量并净化，返回 `None` 表示未配置代理。
+///
+/// 非法值直接报错中止安装，而不是退回直连（直连在需要代理的网络下只会长时间挂起）。
+fn proxy_spec_from_env() -> Result<Option<String>> {
+    for key in ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
+        let Ok(value) = std::env::var(key) else {
+            continue;
+        };
+        if value.trim().is_empty() {
+            continue;
+        }
+        return normalize_proxy_spec(&value)
+            .map_err(|message| anyhow::anyhow!("环境变量 {key} 配置无效：{message}"));
+    }
+    Ok(None)
 }
 
 /// 输出一次下载进度；交互终端单行刷新，其他输出环境按固定字节间隔换行。
@@ -807,8 +874,8 @@ fn decode_registry_string(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_bytes, format_progress_line, is_windows_lock_error, path_contains_entry,
-        safe_archive_entry_path,
+        format_bytes, format_progress_line, is_windows_lock_error, normalize_proxy_spec,
+        path_contains_entry, safe_archive_entry_path,
     };
 
     #[cfg(unix)]
@@ -834,6 +901,26 @@ mod tests {
             format_progress_line(512 * 1024, None),
             "下载进度：已下载 512.0 KiB"
         );
+    }
+
+    #[test]
+    fn normalizes_proxy_specs() {
+        let ok = |value: &str| Ok(Some(value.to_owned()));
+        // 空白视为未设置
+        assert_eq!(normalize_proxy_spec("  "), Ok(None));
+        // 裸地址与认证格式原样通过，http:// 前缀剥掉
+        assert_eq!(normalize_proxy_spec("127.0.0.1:7890"), ok("127.0.0.1:7890"));
+        assert_eq!(
+            normalize_proxy_spec("user:pass@proxy.local:8080"),
+            ok("user:pass@proxy.local:8080")
+        );
+        assert_eq!(
+            normalize_proxy_spec("http://127.0.0.1:7890"),
+            ok("127.0.0.1:7890")
+        );
+        // 非 HTTP 代理明确报错，不允许静默直连
+        assert!(normalize_proxy_spec("socks5://127.0.0.1:1080").is_err());
+        assert!(normalize_proxy_spec("https://proxy.local:8080").is_err());
     }
 
     #[test]
