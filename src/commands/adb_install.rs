@@ -240,18 +240,34 @@ fn is_windows_lock_error(err: &io::Error) -> bool {
 }
 
 /// 从官方 ZIP 下载文件，并按终端类型显示下载进度。
+///
+/// 支持 HTTP 代理：读取环境变量 HTTPS_PROXY/https_proxy/ALL_PROXY/all_proxy
+/// （第一个非空者生效，仅支持 CONNECT 方式的 HTTP 代理，不支持 SOCKS）。
 fn download(url: &str, destination: &Path) -> Result<()> {
     println!("正在下载 Android SDK Platform-Tools...");
-    let response = ureq::get(url)
-        .set("User-Agent", concat!("adbx/", env!("CARGO_PKG_VERSION")))
-        .call()
+    let mut request =
+        minreq::get(url).with_header("User-Agent", concat!("adbx/", env!("CARGO_PKG_VERSION")));
+    if let Some(spec) = proxy_spec_from_env()? {
+        let proxy = minreq::Proxy::new(spec).context("代理配置无效，应为 host:port 格式")?;
+        request = request.with_proxy(proxy);
+    }
+    let response = request
+        .send_lazy()
         .with_context(|| format!("无法下载 Platform-Tools：{url}"))?;
-    let total = response
-        .header("Content-Length")
+    // minreq 对 4xx/5xx 不返回 Err（ureq 会），必须显式检查状态码
+    if !(200..300).contains(&response.status_code) {
+        anyhow::bail!(
+            "下载 Platform-Tools 失败：HTTP {} {}",
+            response.status_code,
+            response.reason_phrase
+        );
+    }
+    let total = header_value(&response.headers, "Content-Length")
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0);
 
-    let mut reader = response.into_reader();
+    // ResponseLazy 自身实现 Read，接管后逐块读取
+    let mut reader = response;
     let mut file = File::create(destination)
         .with_context(|| format!("无法创建下载文件：{}", destination.display()))?;
     let interactive = io::stdout().is_terminal();
@@ -302,6 +318,55 @@ fn download(url: &str, destination: &Path) -> Result<()> {
         println!();
     }
     Ok(())
+}
+
+/// 在响应头列表中按大小写不敏感方式查找指定头字段的值。
+///
+/// minreq v3 保留服务端发来的原始字段名大小写（HTTP/1.1 常见 `Content-Length`，
+/// 代理或 CDN 也可能小写），不能假设固定写法。
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+/// 净化代理环境变量值为 minreq 可用的代理地址。
+///
+/// - 空白值视为未设置，返回 `Ok(None)`
+/// - 裸 `host:port`、`user:pass@host:port` 原样通过
+/// - `http://` 前缀剥掉后通过（CONNECT 代理的常规写法）
+/// - 其他 scheme（`socks5://`、`https://` 等）返回 Err：minreq 仅支持 HTTP 代理，
+///   静默忽略会让请求绕过代理直连，报错比挂起更可诊断
+fn normalize_proxy_spec(raw: &str) -> Result<Option<String>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    if let Some(rest) = trimmed.strip_prefix("http://") {
+        return Ok(Some(rest.to_owned()));
+    }
+    if trimmed.contains("://") {
+        return Err(format!("不支持的代理协议（仅支持 HTTP 代理）：{trimmed}"));
+    }
+    Ok(Some(trimmed.to_owned()))
+}
+
+/// 按优先级读取代理环境变量并净化，返回 `None` 表示未配置代理。
+///
+/// 非法值直接报错中止安装，而不是退回直连（直连在需要代理的网络下只会长时间挂起）。
+fn proxy_spec_from_env() -> Result<Option<String>> {
+    for key in ["HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"] {
+        let Ok(value) = std::env::var(key) else {
+            continue;
+        };
+        if value.trim().is_empty() {
+            continue;
+        }
+        return normalize_proxy_spec(&value)
+            .map_err(|message| anyhow::anyhow!("环境变量 {key} 配置无效：{message}"));
+    }
+    Ok(None)
 }
 
 /// 输出一次下载进度；交互终端单行刷新，其他输出环境按固定字节间隔换行。
@@ -807,8 +872,8 @@ fn decode_registry_string(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_bytes, format_progress_line, is_windows_lock_error, path_contains_entry,
-        safe_archive_entry_path,
+        format_bytes, format_progress_line, header_value, is_windows_lock_error,
+        normalize_proxy_spec, path_contains_entry, safe_archive_entry_path,
     };
 
     #[cfg(unix)]
@@ -834,6 +899,39 @@ mod tests {
             format_progress_line(512 * 1024, None),
             "下载进度：已下载 512.0 KiB"
         );
+    }
+
+    #[test]
+    fn finds_response_header_case_insensitively() {
+        let headers = vec![
+            ("Content-Length".to_owned(), "42".to_owned()),
+            ("x-goog-hash".to_owned(), "abc".to_owned()),
+        ];
+        // minreq v3 保留服务端原始大小写，查找必须不区分大小写
+        assert_eq!(header_value(&headers, "Content-Length"), Some("42"));
+        assert_eq!(header_value(&headers, "content-length"), Some("42"));
+        assert_eq!(header_value(&headers, "CONTENT-LENGTH"), Some("42"));
+        assert_eq!(header_value(&headers, "Content-Type"), None);
+    }
+
+    #[test]
+    fn normalizes_proxy_specs() {
+        let ok = |value: &str| Ok(Some(value.to_owned()));
+        // 空白视为未设置
+        assert_eq!(normalize_proxy_spec("  "), Ok(None));
+        // 裸地址与认证格式原样通过，http:// 前缀剥掉
+        assert_eq!(normalize_proxy_spec("127.0.0.1:7890"), ok("127.0.0.1:7890"));
+        assert_eq!(
+            normalize_proxy_spec("user:pass@proxy.local:8080"),
+            ok("user:pass@proxy.local:8080")
+        );
+        assert_eq!(
+            normalize_proxy_spec("http://127.0.0.1:7890"),
+            ok("127.0.0.1:7890")
+        );
+        // 非 HTTP 代理明确报错，不允许静默直连
+        assert!(normalize_proxy_spec("socks5://127.0.0.1:1080").is_err());
+        assert!(normalize_proxy_spec("https://proxy.local:8080").is_err());
     }
 
     #[test]

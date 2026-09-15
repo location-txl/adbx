@@ -30,6 +30,19 @@ adbx adb-install
 
 下载时会显示进度。交互终端使用单行刷新；输出被重定向或运行在 CI 中时，每隔一段大小输出一行。服务端没有提供总大小时，会持续显示已下载大小。
 
+## 代理
+
+下载源 `dl.google.com` 在部分网络环境下需要代理访问。命令按以下顺序读取环境变量，第一个非空值生效：
+
+`HTTPS_PROXY` → `https_proxy` → `ALL_PROXY` → `all_proxy`
+
+仅支持 HTTP 代理（CONNECT 方式），格式为 `host:port` 或 `user:pass@host:port`，带 `http://` 前缀会自动剥掉；`socks5://` 等其他协议不支持，配置了会直接报错而不是绕过代理直连。
+
+~~~text
+export HTTPS_PROXY=http://127.0.0.1:7890
+adbx adb-install
+~~~
+
 默认安装目录：
 
 - macOS/Linux：`~/.local/share/adbx/platform-tools`

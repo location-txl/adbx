@@ -7,7 +7,6 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 tempfile = "3"
-ureq = "2"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # 预览常见图片格式，并在终端内缩放为彩色半块字符
 image = { version = "0.24.9", default-features = false, features = ["bmp", "gif", "jpeg", "png", "webp"] }
@@ -23,6 +22,17 @@ unicode-width = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
+
+# HTTP 客户端按平台拆分 TLS 后端（不放通用 [dependencies]：target 依赖是并集语义，
+# 通用处再声明会把两套栈同时拉入 Linux）。
+# Linux 保留 rustls 静态 TLS，不引入系统 OpenSSL 动态依赖，发布包保持自包含。
+[target.'cfg(target_os = "linux")'.dependencies]
+minreq = { version = "3", default-features = false, features = ["https-rustls", "proxy"] }
+
+# macOS/Windows 走系统 TLS（Security.framework / Schannel），
+# 去掉 rustls + ring + 内嵌 Mozilla CA 束，二进制体积近乎回到引入下载功能之前。
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+minreq = { version = "3", default-features = false, features = ["https-native-tls", "proxy"] }
 
 # release 体积优化：去符号 + fat LTO + 单 codegen unit + panic abort + 体积优先
 [profile.release]
