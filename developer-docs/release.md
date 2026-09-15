@@ -18,6 +18,17 @@ cargo build --release
 
 这些命令验证源码和构建配置，不替代真实设备上的 adb、TUI 和安装脚本验收。
 
+## Platform-Tools 下载
+
+`adb-install` 使用 ureq 2：Linux 启用 rustls，macOS/Windows 显式配置系统 TLS。
+关闭默认 features，避免非 Linux 目标引入 rustls；代理由命令按环境变量优先级显式配置。
+连接超时为 30 秒，单次读写超时为 60 秒，不限制整个下载的总时长。
+
+未使用 minreq 3.0.0，因为它把单次 TCP 短读当作 CONNECT 响应结束，合法分片会失败，
+响应头恰为 256 字节时还可能挂起。`tests/adb_install_proxy.rs` 使用本地代理覆盖这两个边界，
+检查客户端收到完整响应后发送 TLS 握手，并检查错误输出不含代理凭据；不访问外部网络。
+切换客户端时保留这些回归测试。使用 ureq 会保留 URL 解析依赖，不宣称实现 minreq 的体积收益。
+
 ## GitHub Actions 流程
 
 .github/workflows/release.yml 在推送 v* Tag 后执行：

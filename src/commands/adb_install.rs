@@ -245,29 +245,41 @@ fn is_windows_lock_error(err: &io::Error) -> bool {
 /// （第一个非空者生效，仅支持 CONNECT 方式的 HTTP 代理，不支持 SOCKS）。
 fn download(url: &str, destination: &Path) -> Result<()> {
     println!("正在下载 Android SDK Platform-Tools...");
-    let mut request =
-        minreq::get(url).with_header("User-Agent", concat!("adbx/", env!("CARGO_PKG_VERSION")));
-    if let Some(spec) = proxy_spec_from_env()? {
-        let proxy = minreq::Proxy::new(spec).context("代理配置无效，应为 host:port 格式")?;
-        request = request.with_proxy(proxy);
+    // 显式管理代理优先级，避免客户端再次读取环境变量而覆盖空值处理。
+    let mut builder = ureq::AgentBuilder::new()
+        .try_proxy_from_env(false)
+        .timeout_connect(Duration::from_secs(30))
+        .timeout_read(Duration::from_secs(60))
+        .timeout_write(Duration::from_secs(60))
+        .user_agent(concat!("adbx/", env!("CARGO_PKG_VERSION")));
+    // ureq 的 native-tls feature 只提供适配器，需要显式配置系统 TLS。
+    #[cfg(not(target_os = "linux"))]
+    {
+        let connector = ureq::native_tls::TlsConnector::new().context("无法初始化系统 TLS")?;
+        builder = builder.tls_connector(std::sync::Arc::new(connector));
     }
-    let response = request
-        .send_lazy()
+    if let Some(spec) = proxy_spec_from_env()? {
+        let proxy = ureq::Proxy::new(spec).context("代理配置无效，应为 host:port 格式")?;
+        builder = builder.proxy(proxy);
+    }
+    let response = builder
+        .build()
+        .get(url)
+        .call()
         .with_context(|| format!("无法下载 Platform-Tools：{url}"))?;
-    // minreq 对 4xx/5xx 不返回 Err（ureq 会），必须显式检查状态码
-    if !(200..300).contains(&response.status_code) {
+    if !(200..300).contains(&response.status()) {
         anyhow::bail!(
             "下载 Platform-Tools 失败：HTTP {} {}",
-            response.status_code,
-            response.reason_phrase
+            response.status(),
+            response.status_text()
         );
     }
-    let total = header_value(&response.headers, "Content-Length")
+    let total = response
+        .header("Content-Length")
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0);
 
-    // ResponseLazy 自身实现 Read，接管后逐块读取
-    let mut reader = response;
+    let mut reader = response.into_reader();
     let mut file = File::create(destination)
         .with_context(|| format!("无法创建下载文件：{}", destination.display()))?;
     let interactive = io::stdout().is_terminal();
@@ -320,23 +332,12 @@ fn download(url: &str, destination: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 在响应头列表中按大小写不敏感方式查找指定头字段的值。
-///
-/// minreq v3 保留服务端发来的原始字段名大小写（HTTP/1.1 常见 `Content-Length`，
-/// 代理或 CDN 也可能小写），不能假设固定写法。
-fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    headers
-        .iter()
-        .find(|(key, _)| key.eq_ignore_ascii_case(name))
-        .map(|(_, value)| value.as_str())
-}
-
-/// 净化代理环境变量值为 minreq 可用的代理地址。
+/// 净化代理环境变量值为 HTTP 客户端可用的代理地址。
 ///
 /// - 空白值视为未设置，返回 `Ok(None)`
 /// - 裸 `host:port`、`user:pass@host:port` 原样通过
 /// - `http://` 前缀剥掉后通过（CONNECT 代理的常规写法）
-/// - 其他 scheme（`socks5://`、`https://` 等）返回 Err：minreq 仅支持 HTTP 代理，
+/// - 其他 scheme（`socks5://`、`https://` 等）返回 Err：仅启用 HTTP 代理，
 ///   静默忽略会让请求绕过代理直连，报错比挂起更可诊断
 fn normalize_proxy_spec(raw: &str) -> Result<Option<String>, String> {
     let trimmed = raw.trim();
@@ -347,7 +348,8 @@ fn normalize_proxy_spec(raw: &str) -> Result<Option<String>, String> {
         return Ok(Some(rest.to_owned()));
     }
     if trimmed.contains("://") {
-        return Err(format!("不支持的代理协议（仅支持 HTTP 代理）：{trimmed}"));
+        // 原始值可能带用户名和密码，错误中不回显代理地址。
+        return Err("不支持的代理协议（仅支持 HTTP 代理）".to_owned());
     }
     Ok(Some(trimmed.to_owned()))
 }
@@ -872,8 +874,8 @@ fn decode_registry_string(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_bytes, format_progress_line, header_value, is_windows_lock_error,
-        normalize_proxy_spec, path_contains_entry, safe_archive_entry_path,
+        format_bytes, format_progress_line, is_windows_lock_error, normalize_proxy_spec,
+        path_contains_entry, safe_archive_entry_path,
     };
 
     #[cfg(unix)]
@@ -899,19 +901,6 @@ mod tests {
             format_progress_line(512 * 1024, None),
             "下载进度：已下载 512.0 KiB"
         );
-    }
-
-    #[test]
-    fn finds_response_header_case_insensitively() {
-        let headers = vec![
-            ("Content-Length".to_owned(), "42".to_owned()),
-            ("x-goog-hash".to_owned(), "abc".to_owned()),
-        ];
-        // minreq v3 保留服务端原始大小写，查找必须不区分大小写
-        assert_eq!(header_value(&headers, "Content-Length"), Some("42"));
-        assert_eq!(header_value(&headers, "content-length"), Some("42"));
-        assert_eq!(header_value(&headers, "CONTENT-LENGTH"), Some("42"));
-        assert_eq!(header_value(&headers, "Content-Type"), None);
     }
 
     #[test]

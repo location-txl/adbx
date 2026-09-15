@@ -38,6 +38,8 @@ adbx adb-install
 
 仅支持 HTTP 代理（CONNECT 方式），格式为 `host:port` 或 `user:pass@host:port`，带 `http://` 前缀会自动剥掉；`socks5://` 等其他协议不支持，配置了会直接报错而不是绕过代理直连。
 
+代理配置错误不会回显认证信息。连接超时为 30 秒，单次读写超时为 60 秒；慢速下载只要持续收到数据就可以继续。
+
 ~~~text
 export HTTPS_PROXY=http://127.0.0.1:7890
 adbx adb-install
