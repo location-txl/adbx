@@ -26,10 +26,17 @@ adb devices
 
 第一次连接时，设备会询问是否允许这台电脑调试。选择允许，并再次运行 `adb devices`；列表中的状态应为 `device`。
 
-如果连接了多台设备，记下要操作的 serial，后续用 `-s` 指定：
+如果连接了多台设备，记下要操作的 serial，用 `-s` 指定：
 
 ~~~bash
 adbx -s emulator-5554 info setting
+~~~
+
+也可以把设备绑定到当前终端，之后本终端的命令都默认作用于它（需要一次性安装终端集成，详见 [设备绑定](device-session.md)）：
+
+~~~bash
+adbx use emulator-5554
+adbx info setting
 ~~~
 
 ## 3. 检查 adbx

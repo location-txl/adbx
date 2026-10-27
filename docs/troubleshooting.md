@@ -37,6 +37,12 @@ adbx -s emulator-5554 browse
 
 原生 adb 透传也支持同样的写法，例如 `adbx -s emulator-5554 shell ls /sdcard`。
 
+多台设备之间频繁切换时，可以用 `adbx use <serial>` 把设备绑定到当前终端，之后省略 `-s`；详见 [设备绑定](device-session.md)。
+
+## adbx use 提示需要终端集成
+
+`use`/`unuse` 需要修改当前 Shell 的环境变量，直接调用二进制无法完成。按命令输出安装一次集成（zsh/bash 写入 rc 文件，PowerShell 写入 `$PROFILE`），重开终端即可；详见 [设备绑定](device-session.md)。
+
 ## 关键词没有命中或命中太多
 
 先用只读命令查看结果：

@@ -126,8 +126,13 @@ mod tests {
                     | "disable"
                     | "info"
                     | "browse"
+                    | "use"
+                    | "unuse"
+                    | "current"
+                    | "init"
                     | "doctor"
                     | "adb-install"
+                    | "__resolve-device"
                     | "help"
             )
         })
@@ -164,6 +169,17 @@ mod tests {
         // enable/disable 是 adbx 子命令（adb 顶层没有同名子命令，无遮蔽）
         assert_eq!(route(&["enable", "wanandroid"]), Route::Own);
         assert_eq!(route(&["disable", "browser"]), Route::Own);
+    }
+
+    #[test]
+    fn device_session_commands_route_to_own() {
+        // use/unuse/current/init 是 adbx 子命令；use 未装终端集成时也要由
+        // clap 流程给出指引，不能透传给 adb 报 unknown command
+        assert_eq!(route(&["use", "emulator-5554"]), Route::Own);
+        assert_eq!(route(&["unuse"]), Route::Own);
+        assert_eq!(route(&["current"]), Route::Own);
+        assert_eq!(route(&["init", "zsh"]), Route::Own);
+        assert_eq!(route(&["__resolve-device"]), Route::Own);
     }
 
     #[test]

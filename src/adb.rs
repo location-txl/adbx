@@ -162,6 +162,58 @@ pub(crate) fn adb_version_at(path: &Path) -> Result<String> {
         .unwrap_or_else(|| stdout.lines().next().unwrap_or_default().trim().to_owned()))
 }
 
+/// 一台已连接设备的快照（来自 `adb devices -l`）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceEntry {
+    /// adb 设备 serial（USB 序列号、emulator-xxxx 或 ip:port 形式）
+    pub serial: String,
+    /// 连接状态：`device`（可用）、`offline`、`unauthorized`、`bootloader` 等
+    pub state: String,
+    /// 设备型号（`model:` 字段，下划线已按 Android 惯例替换为空格）；描述缺省时为空
+    pub model: String,
+}
+
+impl DeviceEntry {
+    /// 状态是否为 `device`，即当前可执行命令。
+    pub fn is_ready(&self) -> bool {
+        self.state == "device"
+    }
+}
+
+/// 解析 `adb devices -l` 输出为设备列表（纯函数，可单测）。
+///
+/// 输出首行为 `List of devices attached` 标题；其后每行第一段是 serial、
+/// 第二段是状态，剩余为 `key:value` 描述字段，从中提取 `model:`。
+/// 空行与不足两段的杂项行跳过；`model:` 缺失（如 offline 设备）置空。
+fn parse_devices_output(output: &str) -> Vec<DeviceEntry> {
+    output
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !line.starts_with("List of devices"))
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            let serial = fields.next()?;
+            let state = fields.next()?;
+            let model = fields
+                .find_map(|f| f.strip_prefix("model:"))
+                .unwrap_or_default()
+                .replace('_', " ");
+            Some(DeviceEntry {
+                serial: serial.to_owned(),
+                state: state.to_owned(),
+                model,
+            })
+        })
+        .collect()
+}
+
+/// 列出当前连接的全部设备（`adb devices -l`）。
+///
+/// 与具体设备选择无关，恒不传 `-s`。adb 缺失或 server 启动失败时返回 Err。
+pub fn list_devices() -> Result<Vec<DeviceEntry>> {
+    let out = run_adb(None, &["devices", "-l"])?;
+    Ok(parse_devices_output(&out))
+}
+
 /// 获取设备上已安装的全部包名。
 ///
 /// 基于 `pm list packages`，已去掉每行的 `package:` 前缀。
@@ -618,6 +670,49 @@ mod tests {
     fn parses_standard_version_output() {
         let out = "Android Debug Bridge version 1.0.41\nVersion 35.0.0-11465562\n";
         assert_eq!(parse_adb_version(out).as_deref(), Some("1.0.41"));
+    }
+
+    #[test]
+    fn parses_devices_output_with_models() {
+        // 真机 + 模拟器混合：-l 长格式，serial 与状态间为制表符/空格混合
+        let out = "List of devices attached\n\
+                   emulator-5554\tdevice product:sdk_gphone64_x86_64 model:sdk_gphone64_x86_64 device:emu64xa transport_id:1\n\
+                   ZX1G22B7QN\t device usb:1-1 product:redfin model:Pixel_5 transport_id:2\n";
+        assert_eq!(
+            super::parse_devices_output(out),
+            vec![
+                super::DeviceEntry {
+                    serial: "emulator-5554".into(),
+                    state: "device".into(),
+                    model: "sdk gphone64 x86 64".into(),
+                },
+                super::DeviceEntry {
+                    serial: "ZX1G22B7QN".into(),
+                    state: "device".into(),
+                    model: "Pixel 5".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_devices_output_without_model_field() {
+        // offline/unauthorized 设备没有 key:value 描述段，model 置空
+        let out = "List of devices attached\n192.168.1.5:5555\toffline\r\nemulator-5556\tunauthorized\r\n";
+        let devices = super::parse_devices_output(out);
+        assert_eq!(devices.len(), 2);
+        assert!(!devices[0].is_ready());
+        assert_eq!(devices[0].model, "");
+        assert_eq!(devices[1].state, "unauthorized");
+    }
+
+    #[test]
+    fn parses_devices_output_skips_header_and_junk() {
+        // 仅标题行、空行或单字段杂项行都不产出设备
+        //（adb 的 daemon 启动消息走 stderr，不混入 stdout）
+        assert!(super::parse_devices_output("List of devices attached\n").is_empty());
+        assert!(super::parse_devices_output("").is_empty());
+        assert!(super::parse_devices_output("\n\njunk\n").is_empty());
     }
 
     #[test]

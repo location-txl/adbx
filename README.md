@@ -19,7 +19,7 @@ adbx stop wanandroid
 - 用关键词停止、重启、清除数据、卸载、禁用、启用应用。
 - 查看应用的完整包名和版本信息。
 - 在终端里浏览设备文件，批量拉取、预览或编辑文本。
-- 多台设备同时连接时，用 serial 指定目标。
+- 多台设备同时连接时，用 `adbx use` 把设备绑定到当前终端，各终端互不影响。
 - 用 `adbx shell`、`adbx logcat`、`adbx install` 等方式继续调用 adb。
 
 ## 安装
@@ -106,6 +106,9 @@ adbx [-s <serial>] <命令> [参数]
 | `disable <关键词>...` | 禁用应用，可用 enable 恢复 |
 | `info <关键词>...` | 查看包名和版本信息 |
 | `browse [路径] [-o <目录>]` | 浏览设备文件并批量拉取 |
+| `use [serial]` | 绑定设备到当前终端（需 `adbx init` 集成） |
+| `unuse` | 解除当前终端的设备绑定 |
+| `current` | 显示当前终端绑定的设备 |
 | `doctor` | 检查 adb 是否可用 |
 | `adb-install` | adb 缺失时自动安装官方 Platform-Tools |
 | 其他 adb 命令 | 原样转发给 adb，例如 `shell`、`devices`、`logcat`、`install` |
@@ -115,7 +118,7 @@ adbx [-s <serial>] <命令> [参数]
 - [使用文档首页](docs/README.md)
 - [stop](docs/stop.md) · [restart](docs/restart.md) · [clear](docs/clear.md) · [uninstall](docs/uninstall.md)
 - [enable](docs/enable.md) · [disable](docs/disable.md) · [info](docs/info.md) · [doctor](docs/doctor.md) · [adb-install](docs/adb-install.md)
-- [browse](docs/browse.md) · [adb 透传](docs/passthrough.md)
+- [browse](docs/browse.md) · [设备绑定](docs/device-session.md) · [adb 透传](docs/passthrough.md)
 
 ## 包名关键词
 
@@ -138,6 +141,10 @@ adbx restart location wanandroid
 
 # 指定设备
 adbx -s 3GKL2NILLN info userdictionary
+
+# 或把设备绑定到当前终端（需先按 docs/device-session.md 安装终端集成）
+adbx use 3GKL2NILLN
+adbx info userdictionary
 
 # 跳过卸载确认（仅在确认目标后使用）
 adbx uninstall -y wanandroid
