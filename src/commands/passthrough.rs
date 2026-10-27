@@ -122,6 +122,8 @@ mod tests {
                     | "clear"
                     | "restart"
                     | "uninstall"
+                    | "enable"
+                    | "disable"
                     | "info"
                     | "browse"
                     | "doctor"
@@ -155,6 +157,13 @@ mod tests {
     #[test]
     fn known_subcommand_routes_to_own() {
         assert_eq!(route(&["stop", "wechat"]), Route::Own);
+    }
+
+    #[test]
+    fn enable_disable_route_to_own() {
+        // enable/disable 是 adbx 子命令（adb 顶层没有同名子命令，无遮蔽）
+        assert_eq!(route(&["enable", "wanandroid"]), Route::Own);
+        assert_eq!(route(&["disable", "browser"]), Route::Own);
     }
 
     #[test]

@@ -3,7 +3,9 @@
 pub mod adb_install;
 pub mod browse;
 pub mod clear;
+pub mod disable;
 pub mod doctor;
+pub mod enable;
 pub mod info;
 pub mod passthrough;
 pub mod restart;

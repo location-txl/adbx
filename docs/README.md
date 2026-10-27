@@ -16,16 +16,16 @@ adbx [-s <serial>] <命令> [参数]
 
 `-s` 可以指定设备 serial。serial 可通过 `adb devices` 查看；只有一台设备连接时通常可以省略。
 
-adbx 是 adb 的超集。stop、clear、restart、uninstall、info、browse、doctor 和 `adb-install` 由 adbx 处理；其他命令直接交给 adb，因此 `adbx devices`、`adbx shell`、`adbx logcat` 和 `adbx install` 都可以直接使用。透传时 stdout、stderr 和退出码与 adb 保持一致，详见 [adb 透传](passthrough.md)。
+adbx 是 adb 的超集。stop、clear、restart、uninstall、enable、disable、info、browse、doctor 和 `adb-install` 由 adbx 处理；其他命令直接交给 adb，因此 `adbx devices`、`adbx shell`、`adbx logcat` 和 `adbx install` 都可以直接使用。透传时 stdout、stderr 和退出码与 adb 保持一致，详见 [adb 透传](passthrough.md)。
 
 ## 包名匹配
 
-stop、restart、clear、uninstall 和 info 都接受一个或多个关键词：
+stop、restart、clear、uninstall、enable、disable 和 info 都接受一个或多个关键词：
 
 - 不区分大小写；
 - 多个关键词是 AND 关系，包名必须同时包含所有关键词；
 - 单个关键词刚好等于完整包名时，优先精确匹配；
-- stop、restart、clear、uninstall 遇到多个候选会停止执行并列出候选；info 是只读命令，会展示全部候选；
+- stop、restart、clear、uninstall、enable、disable 遇到多个候选会停止执行并列出候选；info 是只读命令，会展示全部候选；
 - 零命中会报错并返回非零退出码。
 
 不确定目标时，先运行 `adbx info <关键词>`。
@@ -38,6 +38,8 @@ stop、restart、clear、uninstall 和 info 都接受一个或多个关键词：
 | [restart](restart.md) | 重启应用 |
 | [clear](clear.md) | 清除应用数据 |
 | [uninstall](uninstall.md) | 卸载应用 |
+| [enable](enable.md) | 启用应用 |
+| [disable](disable.md) | 禁用应用 |
 | [info](info.md) | 查看版本信息 |
 | [browse](browse.md) | 浏览、预览、编辑和拉取设备文件 |
 | [doctor](doctor.md) | 检查 adb 环境 |

@@ -240,13 +240,10 @@ pub fn clear_data(serial: Option<&str>, package: &str) -> Result<()> {
 pub fn uninstall(serial: Option<&str>, package: &str) -> Result<()> {
     let (stdout, stderr) = run_adb_raw(serial, &["shell", "pm", "uninstall", package])?;
     if !is_uninstall_success(&stdout, &stderr) {
-        // 优先报 stderr（异常栈），stdout 无内容时兜底（Failure 场景）
-        let detail = if stderr.trim().is_empty() {
-            stdout.trim()
-        } else {
-            stderr.trim()
-        };
-        anyhow::bail!("卸载 {package} 失败：{detail}");
+        anyhow::bail!(
+            "卸载 {package} 失败：{}",
+            pm_failure_detail(&stdout, &stderr)
+        );
     }
     Ok(())
 }
@@ -257,6 +254,64 @@ pub fn uninstall(serial: Option<&str>, package: &str) -> Result<()> {
 /// （Java 异常），要么 stdout 含 `Failure`，二者任一出现即视为失败。
 fn is_uninstall_success(stdout: &str, stderr: &str) -> bool {
     stderr.trim().is_empty() && !stdout.contains("Failure")
+}
+
+/// 启用指定包名的应用（`pm enable`）。
+///
+/// * `package` - 完整包名；应用已处于启用态时也会成功（幂等）
+///
+/// 与 [`uninstall`] 同理，除退出码外还校验输出：部分 Android 的 pm 失败时
+/// 退出码仍为 0。校验不通过时返回 Err 并透传 pm 的报错原文。
+pub fn enable_package(serial: Option<&str>, package: &str) -> Result<()> {
+    let (stdout, stderr) = run_adb_raw(serial, &["shell", "pm", "enable", package])?;
+    ensure_pm_state_change(&stdout, &stderr, "启用", package)
+}
+
+/// 禁用指定包名的应用（`pm disable-user --user 0`）。
+///
+/// * `package` - 完整包名；固定作用于主用户 0——adb shell 权限下
+///   `pm disable` 会抛 SecurityException，disable-user 是可用的禁用方式
+///
+/// 禁用可由 [`enable_package`] 恢复（应用与数据保留，只是无法运行）。
+/// 输出校验同 [`uninstall`]，校验不通过时返回 Err 并透传 pm 的报错原文。
+pub fn disable_package(serial: Option<&str>, package: &str) -> Result<()> {
+    let (stdout, stderr) = run_adb_raw(
+        serial,
+        &["shell", "pm", "disable-user", "--user", "0", package],
+    )?;
+    ensure_pm_state_change(&stdout, &stderr, "禁用", package)
+}
+
+/// 校验 pm enable/disable-user 的输出，失败时用 [`pm_failure_detail`] 组装报错。
+fn ensure_pm_state_change(stdout: &str, stderr: &str, action: &str, package: &str) -> Result<()> {
+    if is_pm_state_change_success(stdout) {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "{action} {package} 失败：{}",
+        pm_failure_detail(stdout, stderr)
+    );
+}
+
+/// 判断 pm enable/disable-user 的输出是否表示成功（纯函数，可单测）。
+///
+/// 成功时 stdout 形如 `Package <pkg> new state: enabled`（或 `disabled-user`），
+/// 以该标记判定；失败形态（stdout 打 `Failure [...]`、异常只打到 stderr、
+/// stdout 为空）都不含该标记。不看 stderr：部分 ROM 成功时也会向 stderr
+/// 输出良性警告，不能据此判失败——stderr 只用于组装失败文案
+/// （[`pm_failure_detail`]）。
+fn is_pm_state_change_success(stdout: &str) -> bool {
+    stdout.contains("new state:")
+}
+
+/// pm 系命令失败的报错文案（纯函数，可单测）：
+/// 优先 stderr（Java 异常栈），为空时兜底 stdout（`Failure [...]` 场景）。
+fn pm_failure_detail<'a>(stdout: &'a str, stderr: &'a str) -> &'a str {
+    if stderr.trim().is_empty() {
+        stdout.trim()
+    } else {
+        stderr.trim()
+    }
 }
 
 /// 设备端 shell 参数转义：整体单引号包裹，内部单引号转为 `'\''`（纯函数，可单测）。
@@ -554,8 +609,9 @@ fn tree_size(path: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        du_totals, is_uninstall_success, parse_adb_version, parse_du_lines, pull_with_progress,
-        read_file_command, shell_quote, tree_size, write_file_command,
+        du_totals, is_pm_state_change_success, is_uninstall_success, parse_adb_version,
+        parse_du_lines, pm_failure_detail, pull_with_progress, read_file_command, shell_quote,
+        tree_size, write_file_command,
     };
 
     #[test]
@@ -621,6 +677,40 @@ mod tests {
             "Failure [DELETE_FAILED_INTERNAL_ERROR]\n",
             ""
         ));
+    }
+
+    #[test]
+    fn pm_state_change_success_output_should_pass() {
+        // 成功时 stdout 报新状态：enable 为 enabled，disable-user 为 disabled-user；
+        // 判定只看该标记，设备端 stderr 的良性警告不影响成功（签名上就无 stderr）
+        assert!(is_pm_state_change_success(
+            "Package com.example new state: enabled\n"
+        ));
+        assert!(is_pm_state_change_success(
+            "Package com.example new state: disabled-user\r\n"
+        ));
+    }
+
+    #[test]
+    fn pm_state_change_failure_or_empty_output_should_fail() {
+        // 失败形态：异常只打到 stderr（stdout 为空）、Failure 打在 stdout、无输出
+        assert!(!is_pm_state_change_success(""));
+        assert!(!is_pm_state_change_success(
+            "Failure [ENABLE_FAILED_INTERNAL_ERROR]\n"
+        ));
+    }
+
+    #[test]
+    fn pm_failure_detail_prefers_stderr_over_stdout() {
+        // stderr 有 Java 异常栈时优先报它；stderr 为空时兜底 stdout 的 Failure 文案
+        assert_eq!(
+            pm_failure_detail("", "Error: java.lang.SecurityException: denied\n"),
+            "Error: java.lang.SecurityException: denied\n".trim()
+        );
+        assert_eq!(
+            pm_failure_detail("Failure [xyz]\n", "  \n"),
+            "Failure [xyz]"
+        );
     }
 
     /// 真机回归：不存在的包卸载失败时，uninstall 必须返回 Err（而非误报成功）。

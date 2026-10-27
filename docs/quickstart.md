@@ -68,6 +68,13 @@ adbx uninstall wanandroid
 
 脚本场景可使用 `adbx uninstall -y <关键词>` 跳过确认，但应先用 `info` 验证命中结果。
 
+也可以禁用、启用应用。禁用保留应用和数据，随时可以恢复，适合临时停用预装应用：
+
+~~~bash
+adbx disable wanandroid
+adbx enable wanandroid
+~~~
+
 ## 6. 浏览设备文件
 
 ~~~bash

@@ -51,7 +51,7 @@ adbx info <关键词>
 adbx info location wanandroid
 ~~~
 
-然后把完整包名或更具体的关键词用于 stop、restart、clear 或 uninstall。
+然后把完整包名或更具体的关键词用于 stop、restart、clear、uninstall、enable 或 disable。
 
 ## browse 无法打开
 

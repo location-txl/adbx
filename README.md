@@ -16,7 +16,7 @@ adbx stop wanandroid
 
 ## 适合做什么
 
-- 用关键词停止、重启、清除数据、卸载应用。
+- 用关键词停止、重启、清除数据、卸载、禁用、启用应用。
 - 查看应用的完整包名和版本信息。
 - 在终端里浏览设备文件，批量拉取、预览或编辑文本。
 - 多台设备同时连接时，用 serial 指定目标。
@@ -102,6 +102,8 @@ adbx [-s <serial>] <命令> [参数]
 | `restart <关键词>...` | 停止后重新启动应用 |
 | `clear <关键词>...` | 清除应用数据，不可恢复 |
 | `uninstall [-y] <关键词>...` | 卸载应用，默认会确认 |
+| `enable <关键词>...` | 启用应用 |
+| `disable <关键词>...` | 禁用应用，可用 enable 恢复 |
 | `info <关键词>...` | 查看包名和版本信息 |
 | `browse [路径] [-o <目录>]` | 浏览设备文件并批量拉取 |
 | `doctor` | 检查 adb 是否可用 |
@@ -111,8 +113,8 @@ adbx [-s <serial>] <命令> [参数]
 各命令的完整参数和示例：
 
 - [使用文档首页](docs/README.md)
-- [stop](docs/stop.md) · [restart](docs/restart.md) · [clear](docs/clear.md)
-- [uninstall](docs/uninstall.md) · [info](docs/info.md) · [doctor](docs/doctor.md) · [adb-install](docs/adb-install.md)
+- [stop](docs/stop.md) · [restart](docs/restart.md) · [clear](docs/clear.md) · [uninstall](docs/uninstall.md)
+- [enable](docs/enable.md) · [disable](docs/disable.md) · [info](docs/info.md) · [doctor](docs/doctor.md) · [adb-install](docs/adb-install.md)
 - [browse](docs/browse.md) · [adb 透传](docs/passthrough.md)
 
 ## 包名关键词

@@ -57,6 +57,18 @@ enum Command {
         #[arg(required = true)]
         keywords: Vec<String>,
     },
+    /// 按关键词模糊匹配包名并启用应用（pm enable），多关键词为 AND 关系
+    Enable {
+        /// 包名关键词，要求包名同时包含所有关键词
+        #[arg(required = true)]
+        keywords: Vec<String>,
+    },
+    /// 按关键词模糊匹配包名并禁用应用（pm disable-user，固定主用户 0），多关键词为 AND 关系
+    Disable {
+        /// 包名关键词，要求包名同时包含所有关键词
+        #[arg(required = true)]
+        keywords: Vec<String>,
+    },
     /// 按关键词模糊匹配包名并展示完整包名及版本信息（dumpsys package），多命中时全部展示
     Info {
         /// 包名关键词，要求包名同时包含所有关键词
@@ -112,6 +124,8 @@ fn run() -> Result<()> {
         Command::Uninstall { yes, keywords } => {
             commands::uninstall::run(cli.serial.as_deref(), &keywords, yes)
         }
+        Command::Enable { keywords } => commands::enable::run(cli.serial.as_deref(), &keywords),
+        Command::Disable { keywords } => commands::disable::run(cli.serial.as_deref(), &keywords),
         Command::Info { keywords } => commands::info::run(cli.serial.as_deref(), &keywords),
         Command::Browse { path, output } => {
             commands::browse::run(cli.serial.as_deref(), &path, output.as_deref())
