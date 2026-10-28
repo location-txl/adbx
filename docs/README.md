@@ -14,7 +14,7 @@
 adbx [-s <serial>] <命令> [参数]
 ~~~
 
-`-s` 可以指定设备 serial。serial 可通过 `adb devices` 查看；只有一台设备连接时通常可以省略。
+`-s` 可以指定设备 serial。serial 可通过 `adb devices` 查看；只有一台设备连接时通常可以省略。也可以用 `adbx use <serial>` 把设备绑定到当前终端（读取 `ANDROID_SERIAL` 环境变量，原生 adb 同样遵循），详见 [设备绑定](device-session.md)。
 
 adbx 是 adb 的超集。stop、clear、restart、uninstall、enable、disable、info、browse、doctor 和 `adb-install` 由 adbx 处理；其他命令直接交给 adb，因此 `adbx devices`、`adbx shell`、`adbx logcat` 和 `adbx install` 都可以直接使用。透传时 stdout、stderr 和退出码与 adb 保持一致，详见 [adb 透传](passthrough.md)。
 
@@ -42,6 +42,7 @@ stop、restart、clear、uninstall、enable、disable 和 info 都接受一个�
 | [disable](disable.md) | 禁用应用 |
 | [info](info.md) | 查看版本信息 |
 | [browse](browse.md) | 浏览、预览、编辑和拉取设备文件 |
+| [设备绑定](device-session.md) | use / unuse / current：把设备绑定到当前终端 |
 | [doctor](doctor.md) | 检查 adb 环境 |
 | [adb-install](adb-install.md) | adb 缺失时自动安装官方 Platform-Tools |
 | [adb 透传](passthrough.md) | 使用所有未被 adbx 接管的 adb 命令 |
