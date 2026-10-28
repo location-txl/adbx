@@ -5,8 +5,8 @@
 
 use std::ffi::OsString;
 
-use anyhow::Result;
-use clap::{CommandFactory, Parser, Subcommand};
+use anyhow::{Result, bail};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, parser::ValueSource};
 
 use adbx::commands;
 use adbx::commands::passthrough::Route;
@@ -134,18 +134,21 @@ fn is_known_subcommand(token: &str) -> bool {
         .any(|sc| sc.get_name() == token || sc.get_all_aliases().any(|alias| alias == token))
 }
 
-/// 归一 clap 解析出的 serial（纯函数，可单测）：空串按未设置处理。
+/// 归一 clap 解析出的 serial：空环境变量按未设置处理，显式空参数报错。
 ///
-/// `ANDROID_SERIAL=""` 导出时 clap 的 env 取到 `Some("")`，而原生 adb
-/// 忽略空串；对齐 adb 语义，避免 `-s ""` 与「绑定了空设备」的怪异输出。
-fn normalize_serial(serial: Option<String>) -> Option<String> {
-    serial.filter(|s| !s.is_empty())
+/// 保留参数来源，避免脚本的空 `-s "$DEVICE"` 意外触发自动设备选择。
+fn normalize_serial(serial: Option<String>, source: Option<ValueSource>) -> Result<Option<String>> {
+    if serial.as_deref() == Some("") && source == Some(ValueSource::CommandLine) {
+        bail!("-s/--serial 不能为空，请提供有效的设备 serial");
+    }
+    Ok(serial.filter(|s| !s.is_empty()))
 }
 
 /// 解析命令行参数并分发到对应子命令。
 fn run() -> Result<()> {
-    let mut cli = Cli::parse();
-    cli.serial = normalize_serial(cli.serial);
+    let matches = Cli::command().get_matches();
+    let mut cli = Cli::from_arg_matches(&matches)?;
+    cli.serial = normalize_serial(cli.serial, matches.value_source("serial"))?;
     // 设备类命令的 serial 统一解析：显式 -s / ANDROID_SERIAL 优先，
     // 均缺省时自动选择唯一可用设备（多台/零台时列出清单报错，见 device::auto_serial）。
     // 采用设备命令白名单而非排除清单：新增命令默认不需要设备（安全方向），
@@ -187,27 +190,22 @@ fn run() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, normalize_serial};
-    use clap::Parser;
+    use super::normalize_serial;
+    use clap::parser::ValueSource;
 
     #[test]
-    fn empty_serial_value_is_normalized_to_none() {
-        // ANDROID_SERIAL="" 导出时不能当成绑定了空设备（原生 adb 也忽略空串）
-        assert_eq!(normalize_serial(Some(String::new())), None);
-        assert_eq!(normalize_serial(Some("emu".into())).as_deref(), Some("emu"));
-        assert_eq!(normalize_serial(None), None);
-    }
-
-    // 两个断言放在同一测试：测试默认并行执行，进程级环境变量无法并发修改
-    #[test]
-    fn serial_env_fallback_and_flag_priority() {
-        // clap env 布线：未传 -s 时取 ANDROID_SERIAL
-        unsafe { std::env::set_var("ANDROID_SERIAL", "emulator-env") };
-        let cli = Cli::try_parse_from(["adbx", "current"]).unwrap();
-        assert_eq!(cli.serial.as_deref(), Some("emulator-env"));
-        // 优先级：显式 -s > ANDROID_SERIAL
-        let cli = Cli::try_parse_from(["adbx", "-s", "from-flag", "current"]).unwrap();
-        assert_eq!(cli.serial.as_deref(), Some("from-flag"));
-        unsafe { std::env::remove_var("ANDROID_SERIAL") };
+    fn serial_normalization_distinguishes_empty_flag_from_empty_env() {
+        assert!(normalize_serial(Some(String::new()), Some(ValueSource::CommandLine)).is_err());
+        assert_eq!(
+            normalize_serial(Some(String::new()), Some(ValueSource::EnvVariable)).unwrap(),
+            None
+        );
+        assert_eq!(
+            normalize_serial(Some("emu".into()), Some(ValueSource::CommandLine))
+                .unwrap()
+                .as_deref(),
+            Some("emu")
+        );
+        assert_eq!(normalize_serial(None, None).unwrap(), None);
     }
 }

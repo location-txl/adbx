@@ -11,11 +11,17 @@ use anyhow::{Result, bail};
 const POSIX_SCRIPT: &str = r#"# adbx 终端集成：adbx use <serial> 绑定设备到当前终端，adbx unuse 解除绑定。
 # 由 eval "$(adbx init zsh)" （或 bash）加载；adbx 升级后重开终端即可。
 adbx() {
-    case "$1" in
-        use)
-            case "${2:-}" in
+    if [ "${1:-}" = use ] || [ "${1:-}" = unuse ]; then
+        local arg
+        for arg in "$@"; do
+            case "$arg" in
+                --) break ;;
                 -h|--help) command adbx "$@"; return ;;
             esac
+        done
+    fi
+    case "${1:-}" in
+        use)
             shift
             local serial
             serial="$(command adbx __resolve-device "$@")" || return
@@ -24,9 +30,6 @@ adbx() {
             echo "✓ 当前终端已绑定 $serial"
             ;;
         unuse)
-            case "${2:-}" in
-                -h|--help) command adbx "$@"; return ;;
-            esac
             if [ -n "${ANDROID_SERIAL:-}" ]; then
                 unset ANDROID_SERIAL
                 echo "✓ 已解除设备绑定"
@@ -49,12 +52,17 @@ function adbx {
     $real = Get-Command adbx -CommandType Application | Select-Object -First 1
     # 空 $args 时先取 $null，避免 StrictMode 3.0 下数组越界索引报错
     $first = if ($args.Count -gt 0) { $args[0] }
-    switch -Exact ($first) {
-        'use' {
-            if ($args.Count -ge 2 -and ($args[1] -eq '-h' -or $args[1] -eq '--help')) {
+    if ($first -eq 'use' -or $first -eq 'unuse') {
+        foreach ($arg in $args) {
+            if ($arg -eq '--') { break }
+            if ($arg -eq '-h' -or $arg -eq '--help') {
                 & $real @args
                 return
             }
+        }
+    }
+    switch -Exact ($first) {
+        'use' {
             $rest = @()
             if ($args.Count -gt 1) { $rest = $args[1..($args.Count - 1)] }
             $serial = (& $real __resolve-device @rest | Select-Object -First 1)
@@ -64,10 +72,6 @@ function adbx {
             Write-Host "✓ 当前终端已绑定 $env:ANDROID_SERIAL"
         }
         'unuse' {
-            if ($args.Count -ge 2 -and ($args[1] -eq '-h' -or $args[1] -eq '--help')) {
-                & $real @args
-                return
-            }
             if (Test-Path Env:\ANDROID_SERIAL) {
                 Remove-Item Env:\ANDROID_SERIAL
                 Write-Host "✓ 已解除设备绑定"
@@ -121,7 +125,7 @@ mod tests {
             POSIX_SCRIPT
                 .matches("-h|--help) command adbx \"$@\"; return")
                 .count(),
-            2
+            1
         );
     }
 
@@ -140,6 +144,7 @@ mod tests {
         // use/unuse 的 -h/--help 直通真身，显示自身帮助
         assert!(POWERSHELL_SCRIPT.contains("$first = if ($args.Count -gt 0)"));
         assert!(POWERSHELL_SCRIPT.contains("switch -Exact ($first)"));
-        assert!(POWERSHELL_SCRIPT.contains("-eq '-h' -or $args[1] -eq '--help'"));
+        assert!(POWERSHELL_SCRIPT.contains("foreach ($arg in $args)"));
+        assert!(POWERSHELL_SCRIPT.contains("-eq '-h' -or $arg -eq '--help'"));
     }
 }

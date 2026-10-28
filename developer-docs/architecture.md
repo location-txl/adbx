@@ -33,9 +33,15 @@ main.rs
 
 根参数 -s/--serial 是全局参数，clap 声明 `env = "ANDROID_SERIAL"`，因此优先级为：显式 `-s` > 终端绑定（`adbx use` 写入的环境变量）> 自动选择。doctor 不使用 serial；透传命令在路由阶段捕获 serial，并统一转换为 adb 可识别的 -s <serial>。
 
+自有命令在分发前通过 clap 的 `ValueSource` 区分参数来源：空环境变量视为未绑定，显式空 serial 报错，避免脚本的空变量触发自动设备选择；透传保留 adb 原生行为。
+
 设备类命令在分发处（main.rs 的 run）统一调 `commands::device::auto_serial`：显式值原样透传；缺省时解析 `adb devices -l` 并自动选择唯一可用设备，零台或多台可用时报错并列出清单。doctor、adb-install 与终端集成命令（use/unuse/current/init/__resolve-device）不经过它，保持无设备可用。设备枚举的 I/O 与解析在 adb.rs（list_devices + parse_devices_output），选择与匹配语义（唯一可用、serial 唯一片段、状态校验）在 commands/device.rs 的纯函数中。
 
 终端集成（commands/init.rs 输出 zsh/bash/powershell 包装函数）：Shell 函数拦截 `use`/`unuse` 修改当前终端的 `ANDROID_SERIAL`；设备解析由隐藏命令 `__resolve-device` 完成并向 stdout 输出一行 serial，脚本只捕获输出、不拼接 Shell 代码。透传不经 clap，adb 子进程继承 `ANDROID_SERIAL` 后行为与 adbx 一致。
+
+包装函数在捕获输出或修改绑定前扫描 `use`/`unuse` 的帮助旗标，遇到 `--` 停止扫描；帮助请求交给公开命令，避免帮助正文被保存为 serial。Bash/zsh 使用 `${1:-}` 兼容 `set -u` 下的无参数调用。`tests/device_session.rs` 通过独立子进程、模拟 adb 和生成的脚本验证这些行为，不修改测试进程的环境变量，也不访问真实设备。
+
+该集成测试在 Unix 上运行 Bash，在 macOS 上额外运行系统自带的 zsh。PowerShell 行为测试需要 PATH 中的 `pwsh`，默认忽略，具备环境时执行 `cargo test --test device_session powershell_help -- --ignored`。
 
 adb-install 是主机环境命令，不访问设备。它在 PATH 和 adbx 用户目录中检查 adb，缺失时下载并校验官方 Platform-Tools，再按 Bash、zsh 或 fish 的实际启动规则写入用户级 PATH；Windows 写入注册表后广播 `WM_SETTINGCHANGE/Environment`。下载进度通过分块读取实时输出。
 
